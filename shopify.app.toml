@@ -52,7 +52,7 @@ api_version = "2026-07"
 redirect_urls = [ "https://pet-paiting-app.vercel.app/api/auth" ]
 
 [app_proxy]
-url = "https://pet-paiting-app.vercel.app/apps/piktura"
+url = "https://pet-paiting-app.vercel.app"
 prefix = "apps"
 subpath = "piktura"
 
