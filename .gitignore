@@ -1,0 +1,9 @@
+node_modules/
+build/
+.vercel/
+.react-router/
+.shopify/
+.env
+.DS_Store
+*.log
+*.sqlite

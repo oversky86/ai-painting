@@ -1,0 +1,8 @@
+{
+  "buildCommand": "npx react-router build",
+  "installCommand": "npm install && npx prisma generate",
+  "framework": "react-router",
+  "env": {
+    "NODE_ENV": "production"
+  }
+}
