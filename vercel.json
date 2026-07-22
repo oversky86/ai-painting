@@ -1,5 +1,5 @@
 {
-  "buildCommand": "npx prisma db push --accept-data-loss && npx react-router build"
+  "buildCommand": "npx prisma db push --accept-data-loss && npx react-router build",
   "installCommand": "npm install && npx prisma generate",
   "framework": "react-router",
   "env": {
