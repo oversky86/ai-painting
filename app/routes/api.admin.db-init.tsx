@@ -58,6 +58,10 @@ export async function action({ request }: ActionFunctionArgs) {
     results.paintingStyleTable = "CREATED";
     await prisma.$executeRawUnsafe(`CREATE TABLE IF NOT EXISTS "OrderRecord" ("id" TEXT NOT NULL PRIMARY KEY DEFAULT gen_random_uuid()::text,"shop" TEXT NOT NULL,"shopifyOrderId" TEXT NOT NULL UNIQUE,"generationJobId" TEXT NOT NULL,"customerEmail" TEXT,"totalAmount" TEXT,"createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,CONSTRAINT "OrderRecord_generationJobId_fkey" FOREIGN KEY ("generationJobId") REFERENCES "GenerationJob"("id") ON DELETE RESTRICT ON UPDATE CASCADE)`);
     results.orderRecordTable = "CREATED";
+    await prisma.$executeRawUnsafe(`CREATE TABLE IF NOT EXISTS "FlowSession" ("id" TEXT NOT NULL PRIMARY KEY DEFAULT gen_random_uuid()::text,"shop" TEXT NOT NULL,"visitorKey" TEXT NOT NULL,"photoUrl" TEXT,"style" TEXT,"keywords" TEXT,"currentKeywords" TEXT,"versions" JSONB,"versionIndex" INTEGER NOT NULL DEFAULT -1,"jobId" TEXT,"resultUrl" TEXT,"screen" TEXT,"previewPaused" BOOLEAN NOT NULL DEFAULT false,"firstName" TEXT,"email" TEXT,"phone" TEXT,"createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,"updatedAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP)`);
+    await prisma.$executeRawUnsafe(`CREATE UNIQUE INDEX IF NOT EXISTS "FlowSession_shop_visitorKey_key" ON "FlowSession"("shop", "visitorKey")`);
+    await prisma.$executeRawUnsafe(`CREATE INDEX IF NOT EXISTS "FlowSession_updatedAt_idx" ON "FlowSession"("updatedAt")`);
+    results.flowSessionTable = "CREATED";
   } catch (e: any) { results.ddlError = `DDL FAILED: ${e.message}`; }
   try {
     const tables = await prisma.$queryRaw`SELECT tablename FROM pg_tables WHERE schemaname = 'public' ORDER BY tablename`;

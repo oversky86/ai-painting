@@ -90,3 +90,28 @@ model GenerationUsage {
 
   @@unique([key, date])
 }
+
+// Portrait generation flow session (guest UUID or logged-in customer)
+model FlowSession {
+  id              String   @id @default(cuid())
+  shop            String
+  visitorKey      String   // "guest:{uuid}" or "customer:{id}"
+  photoUrl        String?
+  style           String?
+  keywords        String?
+  currentKeywords String?
+  versions        Json?    // [{url, keywords}]
+  versionIndex    Int      @default(-1)
+  jobId           String?
+  resultUrl       String?
+  screen          String?
+  previewPaused   Boolean  @default(false)
+  firstName       String?
+  email           String?
+  phone           String?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  @@unique([shop, visitorKey])
+  @@index([updatedAt])
+}
