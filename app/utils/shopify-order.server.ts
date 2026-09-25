@@ -12,6 +12,14 @@ export async function getOrderBusinessStatus(
   admin: AdminClient,
   orderGid: string,
 ): Promise<BusinessStatus> {
+  return normalizeBusinessStatus(await readOrderBusinessStatusValue(admin, orderGid));
+}
+
+/** Raw metafield value; null when the order has never been given a status. */
+export async function readOrderBusinessStatusValue(
+  admin: AdminClient,
+  orderGid: string,
+): Promise<string | null> {
   const response = await admin.graphql(
     `#graphql
     query OrderBusinessStatus($id: ID!) {
@@ -25,7 +33,7 @@ export async function getOrderBusinessStatus(
     { variables: { id: orderGid } },
   );
   const json = await response.json();
-  return normalizeBusinessStatus(json?.data?.order?.businessStatus?.value);
+  return json?.data?.order?.businessStatus?.value || null;
 }
 
 export async function setOrderBusinessStatus(
@@ -114,20 +122,36 @@ export async function enableBusinessStatusCustomerRead(
   return { ok: true, message: "customerAccount READ enabled" };
 }
 
+type FulfillmentOrderNode = {
+  id: string;
+  status: string;
+  supportedActions?: Array<{ action: string }>;
+  lineItems?: { nodes: Array<{ id: string; remainingQuantity: number }> };
+};
+
+const DONE_FULFILLMENT_ORDER_STATUSES = new Set(["CLOSED", "CANCELLED"]);
+
+/**
+ * Fulfills every remaining fulfillment order on the order. Fulfillment orders
+ * can sit at different locations and one fulfillmentCreate call only accepts a
+ * single location, so each is fulfilled separately. Safe to call again after a
+ * partial failure: closed fulfillment orders are skipped.
+ */
 export async function createOrderFulfillment(
   admin: AdminClient,
   orderGid: string,
   tracking: { company: string; number: string },
-): Promise<void> {
+): Promise<{ fulfilledCount: number }> {
   const foResponse = await admin.graphql(
     `#graphql
     query OrderFulfillmentOrders($id: ID!) {
       order(id: $id) {
         id
-        fulfillmentOrders(first: 10) {
+        fulfillmentOrders(first: 20) {
           nodes {
             id
             status
+            supportedActions { action }
             lineItems(first: 50) {
               nodes { id remainingQuantity }
             }
@@ -138,58 +162,116 @@ export async function createOrderFulfillment(
     { variables: { id: orderGid } },
   );
   const foJson = await foResponse.json();
-  const fulfillmentOrders =
+  const fulfillmentOrders: FulfillmentOrderNode[] =
     foJson?.data?.order?.fulfillmentOrders?.nodes || [];
-  const open = fulfillmentOrders.find(
-    (fo: { status?: string }) =>
-      fo.status === "OPEN" || fo.status === "IN_PROGRESS",
+  if (!fulfillmentOrders.length) {
+    throw new Error("This order has no fulfillment orders");
+  }
+
+  const pending = fulfillmentOrders.filter(
+    (fo) => !DONE_FULFILLMENT_ORDER_STATUSES.has(fo.status),
   );
-  if (!open?.id) {
-    throw new Error("No open fulfillment order available");
+  const blocked = pending.filter(
+    (fo) =>
+      !fo.supportedActions?.some((a) => a.action === "CREATE_FULFILLMENT"),
+  );
+  if (blocked.length) {
+    throw new Error(
+      `Fulfillment order is ${blocked[0].status}; release it in Shopify admin before shipping`,
+    );
   }
 
-  const lineItems = (open.lineItems?.nodes || [])
-    .filter((li: { remainingQuantity?: number }) => (li.remainingQuantity || 0) > 0)
-    .map((li: { id: string; remainingQuantity: number }) => ({
-      id: li.id,
-      quantity: li.remainingQuantity,
-    }));
+  let fulfilledCount = 0;
+  for (const fo of pending) {
+    const lineItems = (fo.lineItems?.nodes || [])
+      .filter((li) => (li.remainingQuantity || 0) > 0)
+      .map((li) => ({ id: li.id, quantity: li.remainingQuantity }));
+    if (!lineItems.length) continue;
 
-  if (!lineItems.length) {
-    throw new Error("No remaining line items to fulfill");
-  }
-
-  const response = await admin.graphql(
-    `#graphql
-    mutation FulfillOrder($fulfillment: FulfillmentV2Input!) {
-      fulfillmentCreateV2(fulfillment: $fulfillment) {
-        fulfillment { id status }
-        userErrors { message field }
-      }
-    }`,
-    {
-      variables: {
-        fulfillment: {
-          lineItemsByFulfillmentOrder: [
-            {
-              fulfillmentOrderId: open.id,
-              fulfillmentOrderLineItems: lineItems,
+    const response = await admin.graphql(
+      `#graphql
+      mutation FulfillOrder($fulfillment: FulfillmentInput!) {
+        fulfillmentCreate(fulfillment: $fulfillment) {
+          fulfillment { id status }
+          userErrors { message field }
+        }
+      }`,
+      {
+        variables: {
+          fulfillment: {
+            lineItemsByFulfillmentOrder: [
+              { fulfillmentOrderId: fo.id, fulfillmentOrderLineItems: lineItems },
+            ],
+            trackingInfo: {
+              company: tracking.company.slice(0, 100),
+              number: tracking.number.slice(0, 100),
             },
-          ],
-          trackingInfo: {
-            company: tracking.company.slice(0, 100),
-            number: tracking.number.slice(0, 100),
+            notifyCustomer: true,
           },
-          notifyCustomer: true,
         },
       },
-    },
+    );
+    const json = await response.json();
+    const errors = json?.data?.fulfillmentCreate?.userErrors;
+    if (errors?.length) {
+      throw new Error(errors[0].message || "fulfillmentCreate failed");
+    }
+    if (!json?.data?.fulfillmentCreate?.fulfillment) {
+      throw new Error("fulfillmentCreate returned no fulfillment");
+    }
+    fulfilledCount += 1;
+  }
+  return { fulfilledCount };
+}
+
+export type CustomerOrderGate = {
+  id: string;
+  name: string;
+  customerId: string | null;
+  businessStatus: BusinessStatus;
+};
+
+/** One Admin call for many orders: ownership plus current business_status. */
+export async function fetchOrderGates(
+  admin: AdminClient,
+  orderGids: string[],
+): Promise<CustomerOrderGate[]> {
+  if (!orderGids.length) return [];
+  const response = await admin.graphql(
+    `#graphql
+    query OrderGates($ids: [ID!]!) {
+      nodes(ids: $ids) {
+        ... on Order {
+          id
+          name
+          customer { id }
+          businessStatus: metafield(namespace: "custom", key: "business_status") {
+            value
+          }
+        }
+      }
+    }`,
+    { variables: { ids: orderGids } },
   );
   const json = await response.json();
-  const errors = json?.data?.fulfillmentCreateV2?.userErrors;
-  if (errors?.length) {
-    throw new Error(errors[0].message || "fulfillmentCreateV2 failed");
-  }
+  const nodes: Array<{
+    id?: string;
+    name?: string;
+    customer?: { id: string } | null;
+    businessStatus?: { value?: string | null } | null;
+  } | null> = json?.data?.nodes || [];
+  return nodes.flatMap((node) =>
+    node?.id
+      ? [
+          {
+            id: node.id,
+            name: node.name || "",
+            customerId: node.customer?.id || null,
+            businessStatus: normalizeBusinessStatus(node.businessStatus?.value),
+          },
+        ]
+      : [],
+  );
 }
 
 export async function fetchOrderDetailForSupplier(

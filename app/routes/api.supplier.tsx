@@ -1,4 +1,4 @@
-import type { ActionFunctionArgs, LoaderFunctionArgs } from "react-router";
+import type { ActionFunctionArgs } from "react-router";
 import { unauthenticated } from "../shopify.server";
 import {
   assertSupplierHmac,
@@ -7,32 +7,39 @@ import {
   resolveAllowedShop,
 } from "../utils/hmac-auth.server";
 import {
-  assertTransition,
   MAX_PORTRAIT_VERSIONS,
-  type BusinessStatus,
+  normalizeBusinessStatus,
 } from "../utils/business-status.server";
 import {
   createOrderFulfillment,
   enableBusinessStatusCustomerRead,
   fetchOrderDetailForSupplier,
   getOrderBusinessStatus,
-  setOrderBusinessStatus,
 } from "../utils/shopify-order.server";
 import {
   createUploadSignedUrl,
+  deletePortraitVersion,
   getSupplierOrder,
   insertPortraitVersion,
+  isValidUploadPath,
+  latestNoteCounts,
   listModificationRequests,
   listPortraitVersions,
   listSupplierOrders,
-  setSupplierOrderStatus,
-  signedReadUrl,
+  reconcileSupplierOrder,
+  signedReadUrls,
   upsertSupplierOrder,
 } from "../utils/supplier-store.server";
+import { runTransition, TransitionAbort } from "../utils/status-transition.server";
 
 function json(data: unknown, status = 200) {
   return Response.json(data, { status });
 }
+
+const UPLOAD_CONTENT_TYPES = {
+  image: ["image/jpeg", "image/png", "image/webp"],
+  video: ["video/mp4", "video/webm", "video/quicktime"],
+} as const;
 
 async function parseSignedBody(request: Request) {
   const rawBody = await request.text();
@@ -47,7 +54,7 @@ async function parseSignedBody(request: Request) {
   }
 }
 
-export const loader = async (_args: LoaderFunctionArgs) => {
+export const loader = async () => {
   return json({ ok: true, service: "supplier-api" });
 };
 
@@ -84,6 +91,12 @@ export const action = async ({ request }: ActionFunctionArgs) => {
   if (actionType === "list_orders") {
     const tab = (body.tab as "action" | "waiting" | "done") || "action";
     const rows = await listSupplierOrders(shop, tab);
+    const noteCounts = await latestNoteCounts(
+      shop,
+      rows
+        .filter((row) => row.business_status === "supplier_modification")
+        .map((row) => row.shopify_order_id),
+    );
     return json({
       ok: true,
       tab,
@@ -94,6 +107,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
         businessStatus: row.business_status,
         versionCount: row.version_count,
         modificationCount: row.modification_count,
+        latestNoteCount: noteCounts.get(row.shopify_order_id) ?? 0,
         placedAt: row.placed_at,
         trackingCompany: row.tracking_company,
         trackingNumber: row.tracking_number,
@@ -101,15 +115,27 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     });
   }
 
+  const orderId = String(body.orderId || "");
+  if (!orderId) return json({ ok: false, error: "orderId required" }, 400);
+  const shopifyOrderId = orderNumericId(orderId);
+  const ownerId = normalizeOrderGid(orderId);
+
+  async function loadIndex(current: ReturnType<typeof normalizeBusinessStatus>) {
+    const existing = await getSupplierOrder(shop!, shopifyOrderId);
+    if (existing) return existing;
+    return upsertSupplierOrder({
+      shop: shop!,
+      shopifyOrderId,
+      businessStatus: current,
+    });
+  }
+
   if (actionType === "order_detail") {
-    const orderId = String(body.orderId || "");
-    if (!orderId) return json({ ok: false, error: "orderId required" }, 400);
-    const shopifyOrderId = orderNumericId(orderId);
-    const ownerId = normalizeOrderGid(orderId);
     const shopifyOrder = await fetchOrderDetailForSupplier(admin, ownerId);
     if (!shopifyOrder) {
       return json({ ok: false, error: "Order not found" }, 404);
     }
+    const businessStatus = normalizeBusinessStatus(shopifyOrder.businessStatus?.value);
 
     let index = await getSupplierOrder(shop, shopifyOrderId);
     if (!index) {
@@ -118,20 +144,16 @@ export const action = async ({ request }: ActionFunctionArgs) => {
         shopifyOrderId,
         orderName: shopifyOrder.name,
         customerEmail: shopifyOrder.email,
-        businessStatus: await getOrderBusinessStatus(admin, ownerId),
+        businessStatus,
         placedAt: shopifyOrder.createdAt,
       });
     }
+    index = await reconcileSupplierOrder(index, businessStatus);
 
     const versions = await listPortraitVersions(shop, shopifyOrderId);
     const requests = await listModificationRequests(shop, shopifyOrderId);
-    const enrichedVersions = await Promise.all(
-      versions.map(async (v) => ({
-        versionNumber: v.version_number,
-        imageUrl: await signedReadUrl(v.image_path),
-        videoUrl: v.video_path ? await signedReadUrl(v.video_path) : null,
-        createdAt: v.created_at,
-      })),
+    const urls = await signedReadUrls(
+      versions.flatMap((v) => [v.image_path, v.video_path || ""]),
     );
 
     return json({
@@ -151,12 +173,17 @@ export const action = async ({ request }: ActionFunctionArgs) => {
         paintingUrl: shopifyOrder.paintingUrl?.value || null,
         paintingStyle: shopifyOrder.paintingStyle?.value || null,
         giftMessage: shopifyOrder.giftMessage?.value || null,
-        businessStatus: index.business_status,
+        businessStatus,
         versionCount: index.version_count,
         modificationCount: index.modification_count,
         trackingCompany: index.tracking_company,
         trackingNumber: index.tracking_number,
-        versions: enrichedVersions,
+        versions: versions.map((v) => ({
+          versionNumber: v.version_number,
+          imageUrl: urls.get(v.image_path) || null,
+          videoUrl: v.video_path ? urls.get(v.video_path) || null : null,
+          createdAt: v.created_at,
+        })),
         modificationRequests: requests.map((r) => ({
           againstVersion: r.against_version,
           createdAt: r.created_at,
@@ -177,29 +204,18 @@ export const action = async ({ request }: ActionFunctionArgs) => {
   }
 
   if (actionType === "create_upload_url") {
-    const orderId = String(body.orderId || "");
     const kind = body.kind === "video" ? "video" : "image";
-    const contentType = String(body.contentType || "image/jpeg");
-    if (!orderId) return json({ ok: false, error: "orderId required" }, 400);
+    const contentType = String(body.contentType || "");
+    if (!(UPLOAD_CONTENT_TYPES[kind] as readonly string[]).includes(contentType)) {
+      return json({ ok: false, error: `Unsupported ${kind} type: ${contentType || "unknown"}` }, 400);
+    }
 
-    const shopifyOrderId = orderNumericId(orderId);
-    const ownerId = normalizeOrderGid(orderId);
     const current = await getOrderBusinessStatus(admin, ownerId);
     if (current !== "order_placed" && current !== "supplier_modification") {
-      return json(
-        { ok: false, error: `Cannot upload in status ${current}` },
-        409,
-      );
+      return json({ ok: false, error: `Cannot upload in status ${current}` }, 409);
     }
 
-    let index = await getSupplierOrder(shop, shopifyOrderId);
-    if (!index) {
-      index = await upsertSupplierOrder({
-        shop,
-        shopifyOrderId,
-        businessStatus: current,
-      });
-    }
+    const index = await loadIndex(current);
     const nextVersion = (index.version_count || 0) + 1;
     if (nextVersion > MAX_PORTRAIT_VERSIONS) {
       return json({ ok: false, error: "Maximum portrait versions reached" }, 409);
@@ -222,103 +238,102 @@ export const action = async ({ request }: ActionFunctionArgs) => {
   }
 
   if (actionType === "confirm_upload") {
-    const orderId = String(body.orderId || "");
     const imagePath = String(body.imagePath || "");
-    const videoPath = body.videoPath ? String(body.videoPath) : null;
-    if (!orderId || !imagePath) {
-      return json({ ok: false, error: "orderId and imagePath required" }, 400);
-    }
-
-    const shopifyOrderId = orderNumericId(orderId);
-    const ownerId = normalizeOrderGid(orderId);
-    const current = await getOrderBusinessStatus(admin, ownerId);
-    const next: BusinessStatus = "portrait_review";
-    try {
-      assertTransition(current, next);
-    } catch {
+    const videoPath = String(body.videoPath || "");
+    if (!imagePath || !videoPath) {
       return json(
-        { ok: false, error: `Cannot confirm upload from status ${current}` },
-        409,
+        { ok: false, error: "Both the portrait image and the studio video are required" },
+        400,
       );
     }
 
-    let index = await getSupplierOrder(shop, shopifyOrderId);
-    if (!index) {
-      index = await upsertSupplierOrder({
-        shop,
-        shopifyOrderId,
-        businessStatus: current,
-      });
-    }
+    const current = await getOrderBusinessStatus(admin, ownerId);
+    const index = await loadIndex(current);
     const nextVersion = (index.version_count || 0) + 1;
     if (nextVersion > MAX_PORTRAIT_VERSIONS) {
       return json({ ok: false, error: "Maximum portrait versions reached" }, 409);
     }
 
-    await insertPortraitVersion({
-      shop,
-      shopifyOrderId,
-      versionNumber: nextVersion,
-      imagePath,
-      videoPath,
+    const slot = { shop, shopifyOrderId, versionNumber: nextVersion };
+    const [imageOk, videoOk] = await Promise.all([
+      isValidUploadPath({ ...slot, path: imagePath, kind: "image" }),
+      isValidUploadPath({ ...slot, path: videoPath, kind: "video" }),
+    ]);
+    if (!imageOk || !videoOk) {
+      return json(
+        {
+          ok: false,
+          error: `Uploaded files do not match version ${nextVersion} of this order. Upload them again.`,
+        },
+        400,
+      );
+    }
+
+    const outcome = await runTransition({
+      admin,
+      ownerId,
+      index,
+      current,
+      next: "portrait_review",
+      extra: { versionCount: nextVersion },
+      apply: () =>
+        insertPortraitVersion({
+          shop,
+          shopifyOrderId,
+          versionNumber: nextVersion,
+          imagePath,
+          videoPath,
+        }),
+      undo: (version) => deletePortraitVersion(version.id),
     });
-    await setOrderBusinessStatus(admin, ownerId, next);
-    await setSupplierOrderStatus(shop, shopifyOrderId, next, {
-      versionCount: nextVersion,
-    });
+    if (!outcome.ok) return json({ ok: false, error: outcome.error }, outcome.status);
 
     return json({
       ok: true,
-      businessStatus: next,
+      businessStatus: "portrait_review",
       versionNumber: nextVersion,
     });
   }
 
   if (actionType === "ship") {
-    const orderId = String(body.orderId || "");
     const company = String(body.trackingCompany || "").trim();
     const number = String(body.trackingNumber || "").trim();
-    if (!orderId || !company || !number) {
+    if (!company || !number) {
       return json(
-        { ok: false, error: "orderId, trackingCompany, trackingNumber required" },
+        { ok: false, error: "trackingCompany and trackingNumber required" },
         400,
       );
     }
 
-    const shopifyOrderId = orderNumericId(orderId);
-    const ownerId = normalizeOrderGid(orderId);
     const current = await getOrderBusinessStatus(admin, ownerId);
-    const next: BusinessStatus = "shipped";
-    try {
-      assertTransition(current, next);
-    } catch {
-      return json(
-        { ok: false, error: `Cannot ship from status ${current}` },
-        409,
-      );
-    }
+    const index = await loadIndex(current);
+    const tracking = { company, number };
 
-    try {
-      await createOrderFulfillment(admin, ownerId, { company, number });
-    } catch (err) {
-      return json(
-        {
-          ok: false,
-          error: err instanceof Error ? err.message : "Fulfillment failed",
-        },
-        422,
-      );
-    }
-
-    await setOrderBusinessStatus(admin, ownerId, next);
-    await setSupplierOrderStatus(shop, shopifyOrderId, next, {
-      trackingCompany: company,
-      trackingNumber: number,
+    // Retrying after a failed status write is safe: fulfillment skips closed fulfillment orders.
+    const outcome = await runTransition({
+      admin,
+      ownerId,
+      index,
+      current,
+      next: "shipped",
+      extra: { trackingCompany: company, trackingNumber: number },
+      irreversible: true,
+      apply: async () => {
+        try {
+          return await createOrderFulfillment(admin, ownerId, tracking);
+        } catch (err) {
+          throw new TransitionAbort(
+            422,
+            err instanceof Error ? err.message : "Fulfillment failed",
+          );
+        }
+      },
     });
+    if (!outcome.ok) return json({ ok: false, error: outcome.error }, outcome.status);
 
     return json({
       ok: true,
-      businessStatus: next,
+      businessStatus: "shipped",
       trackingCompany: company,
       trackingNumber: number,
     });

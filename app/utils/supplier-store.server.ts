@@ -6,6 +6,15 @@ import {
 
 const BUCKET = "supplier-portraits";
 const SIGNED_URL_TTL_SEC = 60 * 60; // 1 hour
+/** Index rows that disagree with the metafield longer than this are treated as drift, not an in-flight write. */
+const RECONCILE_AFTER_MS = 60 * 1000;
+
+export class ConflictError extends Error {}
+
+function throwDbError(error: { code?: string; message: string }): never {
+  if (error.code === "23505") throw new ConflictError(error.message);
+  throw new Error(error.message);
+}
 
 let client: SupabaseClient | null = null;
 
@@ -68,6 +77,10 @@ function newId(prefix: string) {
   return `${prefix}_${crypto.randomUUID().replace(/-/g, "")}`;
 }
 
+/**
+ * Creates the index row, or refreshes name/email on an existing one.
+ * `businessStatus` only seeds new rows; status changes go through `claimStatus`.
+ */
 export async function upsertSupplierOrder(input: {
   shop: string;
   shopifyOrderId: string;
@@ -79,20 +92,20 @@ export async function upsertSupplierOrder(input: {
   const sb = getClient();
   const id = newId("so");
   const now = new Date().toISOString();
-  const { data: existing } = await sb
-    .from("supplier_orders")
-    .select("*")
-    .eq("shop", input.shop)
-    .eq("shopify_order_id", input.shopifyOrderId)
-    .maybeSingle();
+  const existing = await getSupplierOrder(input.shop, input.shopifyOrderId);
 
   if (existing) {
-    const patch: Record<string, unknown> = { updated_at: now };
-    if (input.orderName) patch.order_name = input.orderName;
-    if (input.customerEmail !== undefined) {
+    const patch: Record<string, unknown> = {};
+    if (input.orderName && input.orderName !== existing.order_name) {
+      patch.order_name = input.orderName;
+    }
+    if (
+      input.customerEmail !== undefined &&
+      input.customerEmail !== existing.customer_email
+    ) {
       patch.customer_email = input.customerEmail;
     }
-    if (input.businessStatus) patch.business_status = input.businessStatus;
+    if (!Object.keys(patch).length) return existing;
     const { data, error } = await sb
       .from("supplier_orders")
       .update(patch)
@@ -120,8 +133,120 @@ export async function upsertSupplierOrder(input: {
     .insert(row)
     .select("*")
     .single();
-  if (error) throw new Error(error.message);
+  if (error) {
+    if (error.code === "23505") {
+      const raced = await getSupplierOrder(input.shop, input.shopifyOrderId);
+      if (raced) return raced;
+    }
+    throwDbError(error);
+  }
   return data as SupplierOrderRow;
+}
+
+export async function getSupplierOrders(
+  shop: string,
+  shopifyOrderIds: string[],
+): Promise<SupplierOrderRow[]> {
+  if (!shopifyOrderIds.length) return [];
+  const sb = getClient();
+  const { data, error } = await sb
+    .from("supplier_orders")
+    .select("*")
+    .eq("shop", shop)
+    .in("shopify_order_id", shopifyOrderIds);
+  if (error) throw new Error(error.message);
+  return (data || []) as SupplierOrderRow[];
+}
+
+type StatusExtra = {
+  versionCount?: number;
+  modificationCount?: number;
+  trackingCompany?: string | null;
+  trackingNumber?: string | null;
+};
+
+function statusPatch(status: BusinessStatus, extra?: StatusExtra) {
+  const patch: Record<string, unknown> = {
+    business_status: status,
+    updated_at: new Date().toISOString(),
+  };
+  if (extra?.versionCount !== undefined) patch.version_count = extra.versionCount;
+  if (extra?.modificationCount !== undefined) {
+    patch.modification_count = extra.modificationCount;
+  }
+  if (extra?.trackingCompany !== undefined) {
+    patch.tracking_company = extra.trackingCompany;
+  }
+  if (extra?.trackingNumber !== undefined) {
+    patch.tracking_number = extra.trackingNumber;
+  }
+  return patch;
+}
+
+/**
+ * Compare-and-set on the index row: only moves `from -> to` when the row still
+ * holds `from` (and the expected counters). Returns null when another request won.
+ */
+export async function claimStatus(input: {
+  row: SupplierOrderRow;
+  from: BusinessStatus;
+  to: BusinessStatus;
+  extra?: StatusExtra;
+}): Promise<SupplierOrderRow | null> {
+  const sb = getClient();
+  const { data, error } = await sb
+    .from("supplier_orders")
+    .update(statusPatch(input.to, input.extra))
+    .eq("id", input.row.id)
+    .eq("business_status", input.from)
+    .eq("version_count", input.row.version_count)
+    .eq("modification_count", input.row.modification_count)
+    .select("*");
+  if (error) throw new Error(error.message);
+  return ((data || [])[0] as SupplierOrderRow | undefined) || null;
+}
+
+/** Puts a claimed row back to its pre-claim snapshot. */
+export async function restoreSupplierOrder(
+  snapshot: SupplierOrderRow,
+): Promise<void> {
+  const sb = getClient();
+  const { error } = await sb
+    .from("supplier_orders")
+    .update({
+      business_status: snapshot.business_status,
+      version_count: snapshot.version_count,
+      modification_count: snapshot.modification_count,
+      tracking_company: snapshot.tracking_company,
+      tracking_number: snapshot.tracking_number,
+      updated_at: new Date().toISOString(),
+    })
+    .eq("id", snapshot.id);
+  if (error) {
+    console.error("[supplier-store] restore failed", snapshot.id, error.message);
+  }
+}
+
+/**
+ * The metafield is the source of truth. When the index has disagreed for longer
+ * than an in-flight write could take, rewrite the index to match it.
+ */
+export async function reconcileSupplierOrder(
+  row: SupplierOrderRow,
+  metafieldStatus: BusinessStatus,
+): Promise<SupplierOrderRow> {
+  if (row.business_status === metafieldStatus) return row;
+  const age = Date.now() - new Date(row.updated_at).getTime();
+  if (age < RECONCILE_AFTER_MS) return row;
+  const sb = getClient();
+  const { data, error } = await sb
+    .from("supplier_orders")
+    .update(statusPatch(metafieldStatus))
+    .eq("id", row.id)
+    .eq("business_status", row.business_status)
+    .select("*");
+  if (error) throw new Error(error.message);
+  return ((data || [])[0] as SupplierOrderRow | undefined) || row;
 }
 
 export async function getSupplierOrder(
@@ -177,50 +302,48 @@ export async function listSupplierOrders(
   });
 }
 
-export async function setSupplierOrderStatus(
+/** Note count of each order's most recent modification request. */
+export async function latestNoteCounts(
+  shop: string,
+  shopifyOrderIds: string[],
+): Promise<Map<string, number>> {
+  const counts = new Map<string, number>();
+  if (!shopifyOrderIds.length) return counts;
+  const requests = await listModificationRequestsForOrders(shop, shopifyOrderIds);
+  for (const [orderId, list] of requests) {
+    const latest = list[list.length - 1];
+    if (latest) counts.set(orderId, latest.notes.length);
+  }
+  return counts;
+}
+
+const UPLOAD_FILE_PATTERN = {
+  image: /^image\.(jpg|png|webp)$/,
+  video: /^video\.(mp4|webm|mov)$/,
+} as const;
+
+export function uploadFolder(
   shop: string,
   shopifyOrderId: string,
-  status: BusinessStatus,
-  extra?: {
-    versionCount?: number;
-    modificationCount?: number;
-    trackingCompany?: string;
-    trackingNumber?: string;
-  },
-): Promise<SupplierOrderRow> {
-  const sb = getClient();
-  const patch: Record<string, unknown> = {
-    business_status: status,
-    updated_at: new Date().toISOString(),
-  };
-  if (extra?.versionCount !== undefined) patch.version_count = extra.versionCount;
-  if (extra?.modificationCount !== undefined) {
-    patch.modification_count = extra.modificationCount;
-  }
-  if (extra?.trackingCompany !== undefined) {
-    patch.tracking_company = extra.trackingCompany;
-  }
-  if (extra?.trackingNumber !== undefined) {
-    patch.tracking_number = extra.trackingNumber;
-  }
+  versionNumber: number,
+): string {
+  return `${shop}/${shopifyOrderId}/v${versionNumber}`;
+}
 
-  const existing = await getSupplierOrder(shop, shopifyOrderId);
-  if (!existing) {
-    return upsertSupplierOrder({
-      shop,
-      shopifyOrderId,
-      businessStatus: status,
-    });
-  }
-
-  const { data, error } = await sb
-    .from("supplier_orders")
-    .update(patch)
-    .eq("id", existing.id)
-    .select("*")
-    .single();
-  if (error) throw new Error(error.message);
-  return data as SupplierOrderRow;
+/** True when `path` is this order/version's upload slot for `kind` and the object exists. */
+export async function isValidUploadPath(input: {
+  path: string;
+  kind: "image" | "video";
+  shop: string;
+  shopifyOrderId: string;
+  versionNumber: number;
+}): Promise<boolean> {
+  const folder = uploadFolder(input.shop, input.shopifyOrderId, input.versionNumber);
+  if (!input.path.startsWith(`${folder}/`)) return false;
+  const file = input.path.slice(folder.length + 1);
+  if (!UPLOAD_FILE_PATTERN[input.kind].test(file)) return false;
+  const { data, error } = await getClient().storage.from(BUCKET).exists(input.path);
+  return !error && data === true;
 }
 
 export async function createUploadSignedUrl(input: {
@@ -243,11 +366,12 @@ export async function createUploadSignedUrl(input: {
         : input.contentType.includes("quicktime")
           ? "mov"
           : "mp4";
-  const path = `${input.shop}/${input.shopifyOrderId}/v${input.versionNumber}/${input.kind}.${ext}`;
+  const path = `${uploadFolder(input.shop, input.shopifyOrderId, input.versionNumber)}/${input.kind}.${ext}`;
 
+  // upsert lets the supplier retry an upload for a version that was never confirmed.
   const { data, error } = await sb.storage
     .from(BUCKET)
-    .createSignedUploadUrl(path);
+    .createSignedUploadUrl(path, { upsert: true });
   if (error || !data) {
     throw new Error(error?.message || "Failed to create signed upload URL");
   }
@@ -262,6 +386,40 @@ export async function signedReadUrl(path: string): Promise<string | null> {
     .createSignedUrl(path, SIGNED_URL_TTL_SEC);
   if (error || !data?.signedUrl) return null;
   return data.signedUrl;
+}
+
+export async function signedReadUrls(
+  paths: string[],
+): Promise<Map<string, string>> {
+  const result = new Map<string, string>();
+  const unique = [...new Set(paths.filter(Boolean))];
+  if (!unique.length) return result;
+  const { data, error } = await getClient()
+    .storage.from(BUCKET)
+    .createSignedUrls(unique, SIGNED_URL_TTL_SEC);
+  if (error || !data) return result;
+  for (const item of data) {
+    if (item.path && item.signedUrl && !item.error) {
+      result.set(item.path, item.signedUrl);
+    }
+  }
+  return result;
+}
+
+export async function deletePortraitVersion(id: string): Promise<void> {
+  const { error } = await getClient()
+    .from("portrait_versions")
+    .delete()
+    .eq("id", id);
+  if (error) console.error("[supplier-store] delete version failed", id, error.message);
+}
+
+export async function deleteModificationRequest(id: string): Promise<void> {
+  const { error } = await getClient()
+    .from("modification_requests")
+    .delete()
+    .eq("id", id);
+  if (error) console.error("[supplier-store] delete request failed", id, error.message);
 }
 
 export async function insertPortraitVersion(input: {
@@ -286,8 +444,29 @@ export async function insertPortraitVersion(input: {
     .insert(row)
     .select("*")
     .single();
-  if (error) throw new Error(error.message);
+  if (error) throwDbError(error);
   return data as PortraitVersionRow;
+}
+
+export async function listPortraitVersionsForOrders(
+  shop: string,
+  shopifyOrderIds: string[],
+): Promise<Map<string, PortraitVersionRow[]>> {
+  const byOrder = new Map<string, PortraitVersionRow[]>();
+  if (!shopifyOrderIds.length) return byOrder;
+  const { data, error } = await getClient()
+    .from("portrait_versions")
+    .select("*")
+    .eq("shop", shop)
+    .in("shopify_order_id", shopifyOrderIds)
+    .order("version_number", { ascending: true });
+  if (error) throw new Error(error.message);
+  for (const row of (data || []) as PortraitVersionRow[]) {
+    const list = byOrder.get(row.shopify_order_id) || [];
+    list.push(row);
+    byOrder.set(row.shopify_order_id, list);
+  }
+  return byOrder;
 }
 
 export async function listPortraitVersions(
@@ -328,7 +507,7 @@ export async function insertModificationRequest(input: {
     .insert(requestRow)
     .select("*")
     .single();
-  if (error) throw new Error(error.message);
+  if (error) throwDbError(error);
 
   const noteRows = input.notes.map((note, index) => ({
     id: newId("mn"),
@@ -345,7 +524,10 @@ export async function insertModificationRequest(input: {
     const { error: noteError } = await sb
       .from("modification_notes")
       .insert(noteRows);
-    if (noteError) throw new Error(noteError.message);
+    if (noteError) {
+      await deleteModificationRequest(requestId);
+      throw new Error(noteError.message);
+    }
   }
 
   return {
@@ -354,32 +536,42 @@ export async function insertModificationRequest(input: {
   };
 }
 
+export type ModificationRequestWithNotes = ModificationRequestRow & {
+  notes: ModificationNoteRow[];
+};
+
 export async function listModificationRequests(
   shop: string,
   shopifyOrderId: string,
-): Promise<
-  Array<
-    ModificationRequestRow & {
-      notes: ModificationNoteRow[];
-    }
-  >
-> {
+): Promise<ModificationRequestWithNotes[]> {
+  const byOrder = await listModificationRequestsForOrders(shop, [shopifyOrderId]);
+  return byOrder.get(shopifyOrderId) || [];
+}
+
+export async function listModificationRequestsForOrders(
+  shop: string,
+  shopifyOrderIds: string[],
+): Promise<Map<string, ModificationRequestWithNotes[]>> {
+  const byOrder = new Map<string, ModificationRequestWithNotes[]>();
+  if (!shopifyOrderIds.length) return byOrder;
   const sb = getClient();
   const { data: requests, error } = await sb
     .from("modification_requests")
     .select("*")
     .eq("shop", shop)
-    .eq("shopify_order_id", shopifyOrderId)
+    .in("shopify_order_id", shopifyOrderIds)
     .order("against_version", { ascending: true });
   if (error) throw new Error(error.message);
   const rows = (requests || []) as ModificationRequestRow[];
-  if (!rows.length) return [];
+  if (!rows.length) return byOrder;
 
-  const ids = rows.map((r) => r.id);
   const { data: notes, error: noteError } = await sb
     .from("modification_notes")
     .select("*")
-    .in("request_id", ids)
+    .in(
+      "request_id",
+      rows.map((r) => r.id),
+    )
     .order("note_index", { ascending: true });
   if (noteError) throw new Error(noteError.message);
 
@@ -390,10 +582,12 @@ export async function listModificationRequests(
     byRequest.set(note.request_id, list);
   }
 
-  return rows.map((r) => ({
-    ...r,
-    notes: byRequest.get(r.id) || [],
-  }));
+  for (const r of rows) {
+    const list = byOrder.get(r.shopify_order_id) || [];
+    list.push({ ...r, notes: byRequest.get(r.id) || [] });
+    byOrder.set(r.shopify_order_id, list);
+  }
+  return byOrder;
 }
 
 export async function recordLoginFailure(ip: string): Promise<{

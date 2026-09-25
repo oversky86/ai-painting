@@ -1,6 +1,11 @@
 import type { ActionFunctionArgs } from "react-router";
 import { authenticate } from "../shopify.server";
 import { upsertSupplierOrder } from "../utils/supplier-store.server";
+import { readOrderBusinessStatusValue } from "../utils/shopify-order.server";
+import {
+  normalizeBusinessStatus,
+  type BusinessStatus,
+} from "../utils/business-status.server";
 
 export const action = async ({ request }: ActionFunctionArgs) => {
   const { topic, shop, payload, admin } = await authenticate.webhook(request);
@@ -52,10 +57,15 @@ export const action = async ({ request }: ActionFunctionArgs) => {
 
     const shopifyOrderId = String(orderPayload.id);
     const ownerId = `gid://shopify/Order/${shopifyOrderId}`;
+    let businessStatus: BusinessStatus = "order_placed";
 
     if (admin) {
+      // Shopify can redeliver orders/create; never push an advanced order back to order_placed.
+      const existingStatus = await readOrderBusinessStatusValue(admin, ownerId);
+      if (existingStatus) businessStatus = normalizeBusinessStatus(existingStatus);
+
       const metafields = [
-        {
+        !existingStatus && {
           ownerId,
           namespace: "custom",
           key: "business_status",
@@ -100,7 +110,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
         console.error(`[Webhook] metafieldsSet errors:`, errors);
       } else {
         console.log(
-          `[Webhook] Set business_status=order_placed for order ${orderPayload.id}`,
+          `[Webhook] Order ${orderPayload.id} business_status=${businessStatus}`,
         );
       }
     } else {
@@ -115,7 +125,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
         shopifyOrderId,
         orderName: orderPayload.name || `#${shopifyOrderId}`,
         customerEmail: orderPayload.email || null,
-        businessStatus: "order_placed",
+        businessStatus,
         placedAt: orderPayload.created_at,
       });
     } catch (indexError) {

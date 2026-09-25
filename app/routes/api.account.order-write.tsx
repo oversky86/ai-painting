@@ -1,4 +1,4 @@
-import type { ActionFunctionArgs, LoaderFunctionArgs } from "react-router";
+import type { ActionFunctionArgs } from "react-router";
 import { unauthenticated } from "../shopify.server";
 import {
   assertAccountHmac,
@@ -8,23 +8,20 @@ import {
   resolveAllowedShop,
 } from "../utils/hmac-auth.server";
 import {
-  assertTransition,
   canRequestModification,
-  type BusinessStatus,
+  normalizeBusinessStatus,
 } from "../utils/business-status.server";
+import { fetchOrderGates } from "../utils/shopify-order.server";
 import {
-  getOrderBusinessStatus,
-  setOrderBusinessStatus,
-} from "../utils/shopify-order.server";
-import {
+  deleteModificationRequest,
   getSupplierOrder,
   insertModificationRequest,
-  listModificationRequests,
-  listPortraitVersions,
-  setSupplierOrderStatus,
-  signedReadUrl,
   upsertSupplierOrder,
 } from "../utils/supplier-store.server";
+import { buildPortraitHistories } from "../utils/portrait-history.server";
+import { runTransition } from "../utils/status-transition.server";
+
+const MAX_BATCH_ORDERS = 25;
 
 function json(data: unknown, status = 200) {
   return Response.json(data, { status });
@@ -104,7 +101,7 @@ function parseNotes(body: {
   return [];
 }
 
-export const loader = async (_args: LoaderFunctionArgs) => {
+export const loader = async () => {
   return json({ ok: true });
 };
 
@@ -118,9 +115,10 @@ export const action = async ({ request }: ActionFunctionArgs) => {
   if (!hmac.ok) return json({ ok: false, error: hmac.error }, hmac.status);
 
   let body: {
-    type?: "review" | "gift" | "shipping" | "portrait_history";
+    type?: "review" | "gift" | "shipping" | "portrait_history" | "portrait_history_batch";
     shop?: string;
     orderId?: string;
+    orderIds?: string[];
     customerId?: string;
     action?: "approve" | "modify";
     note?: string;
@@ -148,7 +146,8 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     return json({ ok: false, error: "Invalid JSON body" }, 400);
   }
 
-  if (!body.type || !body.orderId || !body.customerId) {
+  const isBatch = body.type === "portrait_history_batch";
+  if (!body.type || !body.customerId || (!isBatch && !body.orderId)) {
     return json(
       { ok: false, error: "type, orderId, and customerId are required" },
       400,
@@ -168,8 +167,32 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     return json({ ok: false, error: "Admin session unavailable" }, 503);
   }
 
-  const ownerId = normalizeOrderGid(body.orderId);
-  const shopifyOrderId = orderNumericId(body.orderId);
+  if (isBatch) {
+    const orderGids = [
+      ...new Set((body.orderIds || []).map((id) => normalizeOrderGid(String(id)))),
+    ].slice(0, MAX_BATCH_ORDERS);
+    const customerGid = normalizeCustomerGid(body.customerId);
+    const gates = (await fetchOrderGates(admin, orderGids)).filter(
+      (gate) => gate.customerId === customerGid,
+    );
+    const histories = await buildPortraitHistories(
+      shop,
+      gates.map((gate) => ({
+        shopifyOrderId: orderNumericId(gate.id),
+        businessStatus: gate.businessStatus,
+      })),
+    );
+    return json({
+      ok: true,
+      orders: Object.fromEntries(
+        gates.map((gate) => [gate.id, histories.get(orderNumericId(gate.id))]),
+      ),
+    });
+  }
+
+  const orderId = String(body.orderId);
+  const ownerId = normalizeOrderGid(orderId);
+  const shopifyOrderId = orderNumericId(orderId);
   const customerGid = normalizeCustomerGid(body.customerId);
 
   const ownershipResponse = await admin.graphql(
@@ -183,6 +206,9 @@ export const action = async ({ request }: ActionFunctionArgs) => {
         closedAt
         displayFulfillmentStatus
         customer { id }
+        businessStatus: metafield(namespace: "custom", key: "business_status") {
+          value
+        }
       }
     }`,
     { variables: { id: ownerId } },
@@ -197,38 +223,11 @@ export const action = async ({ request }: ActionFunctionArgs) => {
   }
 
   if (body.type === "portrait_history") {
-    const versions = await listPortraitVersions(shop, shopifyOrderId);
-    const requests = await listModificationRequests(shop, shopifyOrderId);
-    const index = await getSupplierOrder(shop, shopifyOrderId);
-    const enrichedVersions = await Promise.all(
-      versions.map(async (v) => ({
-        versionNumber: v.version_number,
-        imageUrl: await signedReadUrl(v.image_path),
-        videoUrl: v.video_path ? await signedReadUrl(v.video_path) : null,
-        createdAt: v.created_at,
-      })),
-    );
-    return json({
-      ok: true,
-      businessStatus: index?.business_status || (await getOrderBusinessStatus(admin, ownerId)),
-      versionCount: index?.version_count ?? versions.length,
-      modificationCount: index?.modification_count ?? requests.length,
-      versions: enrichedVersions,
-      modificationRequests: requests.map((r) => ({
-        againstVersion: r.against_version,
-        createdAt: r.created_at,
-        notes: r.notes.map((n) => ({
-          id: n.id,
-          text: n.text,
-          selection: {
-            x: Number(n.x),
-            y: Number(n.y),
-            width: Number(n.width),
-            height: Number(n.height),
-          },
-        })),
-      })),
-    });
+    const current = normalizeBusinessStatus(order.businessStatus?.value);
+    const histories = await buildPortraitHistories(shop, [
+      { shopifyOrderId, businessStatus: current },
+    ]);
+    return json({ ok: true, ...histories.get(shopifyOrderId) });
   }
 
   if (body.type === "review") {
@@ -236,7 +235,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       return json({ ok: false, error: "action must be approve or modify" }, 400);
     }
 
-    const current = await getOrderBusinessStatus(admin, ownerId);
+    const current = normalizeBusinessStatus(order.businessStatus?.value);
     let index = await getSupplierOrder(shop, shopifyOrderId);
     if (!index) {
       index = await upsertSupplierOrder({
@@ -249,37 +248,19 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     }
 
     if (body.action === "approve") {
-      const next: BusinessStatus = "prepare_shipment";
-      try {
-        assertTransition(current, next);
-      } catch {
-        return json(
-          { ok: false, error: `Cannot approve from status ${current}` },
-          409,
-        );
-      }
-      await setOrderBusinessStatus(admin, ownerId, next);
-      await setSupplierOrderStatus(shop, shopifyOrderId, next);
-      return json({
-        ok: true,
-        businessStatus: next,
-        orderId: ownerId,
+      const outcome = await runTransition({
+        admin,
+        ownerId,
+        index,
+        current,
+        next: "prepare_shipment",
       });
-    }
-
-    // modify
-    const next: BusinessStatus = "supplier_modification";
-    try {
-      assertTransition(current, next);
-    } catch {
-      return json(
-        { ok: false, error: `Cannot request modification from status ${current}` },
-        409,
-      );
+      if (!outcome.ok) return json({ ok: false, error: outcome.error }, outcome.status);
+      return json({ ok: true, businessStatus: "prepare_shipment", orderId: ownerId });
     }
 
     const versionCount = index.version_count || 0;
-    if (!canRequestModification(versionCount)) {
+    if (current === "portrait_review" && !canRequestModification(versionCount)) {
       return json(
         {
           ok: false,
@@ -295,22 +276,27 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       return json({ ok: false, error: "At least one modification note required" }, 400);
     }
 
-    await insertModificationRequest({
-      shop,
-      shopifyOrderId,
-      againstVersion: versionCount,
-      notes,
+    const outcome = await runTransition({
+      admin,
+      ownerId,
+      index,
+      current,
+      next: "supplier_modification",
+      extra: { modificationCount: (index.modification_count || 0) + 1 },
+      apply: () =>
+        insertModificationRequest({
+          shop,
+          shopifyOrderId,
+          againstVersion: versionCount,
+          notes,
+        }),
+      undo: (created) => deleteModificationRequest(created.request.id),
     });
-
-    const modificationCount = (index.modification_count || 0) + 1;
-    await setOrderBusinessStatus(admin, ownerId, next);
-    await setSupplierOrderStatus(shop, shopifyOrderId, next, {
-      modificationCount,
-    });
+    if (!outcome.ok) return json({ ok: false, error: outcome.error }, outcome.status);
 
     return json({
       ok: true,
-      businessStatus: next,
+      businessStatus: "supplier_modification",
       orderId: ownerId,
       againstVersion: versionCount,
       noteCount: notes.length,
