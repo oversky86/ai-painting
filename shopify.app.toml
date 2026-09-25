@@ -1,13 +1,39 @@
-# Learn more about configuration your app at https://shopify.dev/docs/apps/tools/cli/configuration
+# Learn more about configuring your app at https://shopify.dev/docs/apps/tools/cli/configuration
 
 client_id = "8f74713e6783c3adeb81b302e8e95866"
+name = "ecommerce-pet-app"
 application_url = "https://pet-paiting-app.vercel.app"
 embedded = true
-name = "ecommerce-pet-app"
+
+[build]
+automatically_update_urls_on_dev = true
+
+[webhooks]
+api_version = "2026-07"
+
+  [[webhooks.subscriptions]]
+  uri = "/webhooks/app/uninstalled"
+  topics = [ "app/uninstalled" ]
+
+  [[webhooks.subscriptions]]
+  uri = "/webhooks/orders/create"
+  topics = [ "orders/create" ]
+
+  [[webhooks.subscriptions]]
+  uri = "/webhooks/app/scopes_update"
+  topics = [ "app/scopes_update" ]
 
 [access_scopes]
 # Learn more at https://shopify.dev/docs/apps/tools/cli/configuration#access_scopes
-scopes = "write_products,write_metaobjects,write_metaobject_definitions,read_orders,write_orders,customer_read_orders,customer_read_customers"
+scopes = "customer_read_customers,customer_read_orders,read_customers,read_orders,read_merchant_managed_fulfillment_orders,write_merchant_managed_fulfillment_orders,write_metaobject_definitions,write_metaobjects,write_orders,write_products"
+
+[auth]
+redirect_urls = [ "https://pet-paiting-app.vercel.app/api/auth" ]
+
+[app_proxy]
+url = "https://pet-paiting-app.vercel.app"
+subpath = "piktura"
+prefix = "apps"
 
 [product.metafields.app.demo_info]
 type = "single_line_text_field"
@@ -33,31 +59,7 @@ required = true
 name = "Description"
 type = "multi_line_text_field"
 
-[webhooks]
-api_version = "2026-07"
-
-  [[webhooks.subscriptions]]
-  uri = "/webhooks/app/uninstalled"
-  topics = [ "app/uninstalled" ]
-
-  [[webhooks.subscriptions]]
-  uri = "/webhooks/app/scopes_update"
-  topics = [ "app/scopes_update" ]
-
-  [[webhooks.subscriptions]]
-  uri = "/webhooks/orders/create"
-  topics = [ "orders/create" ]
-
-[auth]
-redirect_urls = [ "https://pet-paiting-app.vercel.app/api/auth" ]
-
-[app_proxy]
-url = "https://pet-paiting-app.vercel.app"
-prefix = "apps"
-subpath = "piktura"
-
 [customer_authentication]
-redirect_uris = ["https://pet-paiting-frontend.vercel.app/api/auth/callback"]
-
-[build]
-automatically_update_urls_on_dev = true
+# Period 1: Vercel default domain for account-web (update after deploy).
+# Deferred: also add https://account.<brand-domain>/api/auth/callback
+redirect_uris = [ "https://ai-painting-account.vercel.app/api/auth/callback" ]

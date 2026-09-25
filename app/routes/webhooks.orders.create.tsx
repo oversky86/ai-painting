@@ -1,5 +1,6 @@
 import type { ActionFunctionArgs } from "react-router";
 import { authenticate } from "../shopify.server";
+import { upsertSupplierOrder } from "../utils/supplier-store.server";
 
 export const action = async ({ request }: ActionFunctionArgs) => {
   const { topic, shop, payload, admin } = await authenticate.webhook(request);
@@ -10,7 +11,9 @@ export const action = async ({ request }: ActionFunctionArgs) => {
 
   const orderPayload = payload as {
     id: number;
+    name?: string;
     email?: string;
+    created_at?: string;
     total_price?: string;
     line_items?: Array<{
       id: number;
@@ -19,91 +22,104 @@ export const action = async ({ request }: ActionFunctionArgs) => {
   };
 
   console.log(`[Webhook] Order ${orderPayload.id} received from ${shop}`);
-  console.log(`[Webhook] admin available: ${!!admin}`);
 
   try {
-    // Log all line item properties for debugging
     for (const item of orderPayload.line_items || []) {
-      console.log(`[Webhook] Line item ${item.id} properties:`, JSON.stringify(item.properties || []));
+      console.log(
+        `[Webhook] Line item ${item.id} properties:`,
+        JSON.stringify(item.properties || []),
+      );
     }
 
-    // Extract custom painting attributes from line item properties
     const customAttrs: Record<string, string> = {};
-    const attrKeys = ["original_photo_url", "painting_url", "style"];
+    const attrKeys = ["original_photo_url", "painting_url", "style"] as const;
+    const normalizePropName = (name: string) =>
+      name.startsWith("_") ? name.slice(1) : name;
 
     for (const item of orderPayload.line_items || []) {
       for (const prop of item.properties || []) {
-        if (attrKeys.includes(prop.name) && prop.value) {
-          customAttrs[prop.name] = prop.value;
+        const key = normalizePropName(prop.name);
+        if (
+          (attrKeys as readonly string[]).includes(key) &&
+          prop.value &&
+          !customAttrs[key]
+        ) {
+          customAttrs[key] = prop.value;
         }
       }
       if (Object.keys(customAttrs).length === attrKeys.length) break;
     }
 
-    console.log(`[Webhook] Extracted custom attrs:`, JSON.stringify(customAttrs));
+    const shopifyOrderId = String(orderPayload.id);
+    const ownerId = `gid://shopify/Order/${shopifyOrderId}`;
 
-    if (!admin) {
-      console.error("[Webhook] No admin session available — cannot set metafields");
-      return new Response();
-    }
-
-    // Set order metafields via Admin API if custom attributes exist
-    if (Object.keys(customAttrs).length > 0) {
+    if (admin) {
       const metafields = [
+        {
+          ownerId,
+          namespace: "custom",
+          key: "business_status",
+          value: "order_placed",
+          type: "single_line_text_field",
+        },
         customAttrs.original_photo_url && {
+          ownerId,
           namespace: "custom",
           key: "original_photo_url",
           value: customAttrs.original_photo_url,
           type: "single_line_text_field",
-          access: "MERCHANT_READ",
         },
         customAttrs.painting_url && {
+          ownerId,
           namespace: "custom",
           key: "painting_url",
           value: customAttrs.painting_url,
           type: "single_line_text_field",
-          access: "MERCHANT_READ",
         },
         customAttrs.style && {
+          ownerId,
           namespace: "custom",
           key: "painting_style",
           value: customAttrs.style,
           type: "single_line_text_field",
-          access: "MERCHANT_READ",
         },
       ].filter(Boolean);
 
-      if (metafields.length > 0) {
-        const ownerId = `gid://shopify/Order/${orderPayload.id}`;
-        const variables = {
-          ownerId,
-          metafields: metafields.map((mf) => ({ ...mf, ownerId })),
-        };
-
-        console.log(`[Webhook] Setting ${metafields.length} metafields for order ${orderPayload.id}`);
-
-        const response = await admin.graphql(
-          `mutation SetOrderMetafields($metafields: [MetafieldsSetInput!]!) {
-            metafieldsSet(metafields: $metafields) {
-              metafields { id key namespace }
-              userErrors { message field }
-            }
-          }`,
-          { variables }
+      const response = await admin.graphql(
+        `mutation SetOrderMetafields($metafields: [MetafieldsSetInput!]!) {
+          metafieldsSet(metafields: $metafields) {
+            metafields { id key namespace }
+            userErrors { message field }
+          }
+        }`,
+        { variables: { metafields } },
+      );
+      const json = await response.json();
+      const errors = json.data?.metafieldsSet?.userErrors;
+      if (errors?.length) {
+        console.error(`[Webhook] metafieldsSet errors:`, errors);
+      } else {
+        console.log(
+          `[Webhook] Set business_status=order_placed for order ${orderPayload.id}`,
         );
-
-        const json = await response.json();
-        console.log(`[Webhook] GraphQL response:`, JSON.stringify(json));
-
-        const errors = json.data?.metafieldsSet?.userErrors;
-        if (errors?.length) {
-          console.error(`[Webhook] metafieldsSet errors:`, errors);
-        } else {
-          console.log(`[Webhook] Successfully set ${metafields.length} metafields for order ${orderPayload.id}`);
-        }
       }
     } else {
-      console.log(`[Webhook] No custom attributes found in order ${orderPayload.id} — skipping metafields`);
+      console.error(
+        "[Webhook] No admin session — cannot set metafields; still indexing",
+      );
+    }
+
+    try {
+      await upsertSupplierOrder({
+        shop,
+        shopifyOrderId,
+        orderName: orderPayload.name || `#${shopifyOrderId}`,
+        customerEmail: orderPayload.email || null,
+        businessStatus: "order_placed",
+        placedAt: orderPayload.created_at,
+      });
+    } catch (indexError) {
+      console.error("[Webhook] supplier_orders upsert failed:", indexError);
     }
   } catch (error) {
     console.error("[Webhook] Order processing error:", error);

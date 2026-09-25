@@ -1,0 +1,40 @@
+# ai-painting App — 正式店铺 w4yzmt-vv.myshopify.com
+# 与 ecommerce-pet-app 共用同一 Vercel 后端
+
+client_id = "95a4a9972a0fc9d0d899293e2b62644f"
+name = "ai-painting"
+application_url = "https://pet-paiting-app.vercel.app"
+embedded = true
+
+[build]
+automatically_update_urls_on_dev = false
+
+[webhooks]
+api_version = "2026-07"
+
+  [[webhooks.subscriptions]]
+  uri = "/webhooks/app/uninstalled"
+  topics = [ "app/uninstalled" ]
+
+  [[webhooks.subscriptions]]
+  uri = "/webhooks/orders/create"
+  topics = [ "orders/create" ]
+
+  [[webhooks.subscriptions]]
+  uri = "/webhooks/app/scopes_update"
+  topics = [ "app/scopes_update" ]
+
+[access_scopes]
+scopes = "customer_read_customers,customer_read_orders,read_customers,read_orders,read_merchant_managed_fulfillment_orders,write_merchant_managed_fulfillment_orders,write_metaobject_definitions,write_metaobjects,write_orders,write_products"
+
+[auth]
+redirect_urls = [ "https://pet-paiting-app.vercel.app/api/auth" ]
+
+[app_proxy]
+url = "https://pet-paiting-app.vercel.app"
+subpath = "piktura"
+prefix = "apps"
+
+[customer_authentication]
+# Period 1 Vercel URL — replace with real account-web *.vercel.app after first deploy
+redirect_uris = [ "https://ai-painting-account.vercel.app/api/auth/callback" ]

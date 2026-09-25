@@ -1,45 +1,33 @@
-import { createHmac, timingSafeEqual } from "node:crypto";
 import type { ActionFunctionArgs, LoaderFunctionArgs } from "react-router";
 import { unauthenticated } from "../shopify.server";
-
-/**
- * Server-to-server write API for account-web (HMAC).
- * Actions: review | gift | shipping
- */
-
-const MAX_SKEW_SEC = 300;
+import {
+  assertAccountHmac,
+  normalizeCustomerGid,
+  normalizeOrderGid,
+  orderNumericId,
+  resolveAllowedShop,
+} from "../utils/hmac-auth.server";
+import {
+  assertTransition,
+  canRequestModification,
+  type BusinessStatus,
+} from "../utils/business-status.server";
+import {
+  getOrderBusinessStatus,
+  setOrderBusinessStatus,
+} from "../utils/shopify-order.server";
+import {
+  getSupplierOrder,
+  insertModificationRequest,
+  listModificationRequests,
+  listPortraitVersions,
+  setSupplierOrderStatus,
+  signedReadUrl,
+  upsertSupplierOrder,
+} from "../utils/supplier-store.server";
 
 function json(data: unknown, status = 200) {
   return Response.json(data, { status });
-}
-
-function normalizeOrderGid(orderId: string): string {
-  if (orderId.startsWith("gid://")) return orderId;
-  return `gid://shopify/Order/${orderId}`;
-}
-
-function normalizeCustomerGid(id: string): string {
-  if (id.startsWith("gid://")) return id;
-  return `gid://shopify/Customer/${id}`;
-}
-
-function verifyHmac(
-  timestamp: string,
-  rawBody: string,
-  signature: string,
-  secret: string,
-): boolean {
-  const expected = createHmac("sha256", secret)
-    .update(`${timestamp}.${rawBody}`)
-    .digest("hex");
-  try {
-    return timingSafeEqual(
-      Buffer.from(expected, "hex"),
-      Buffer.from(signature, "hex"),
-    );
-  } catch {
-    return false;
-  }
 }
 
 function isEditable(order: {
@@ -61,6 +49,61 @@ function isEditable(order: {
   return { ok: true };
 }
 
+type NoteInput = {
+  text?: string;
+  selection?: { x?: number; y?: number; width?: number; height?: number };
+};
+
+function parseNotes(body: {
+  notes?: NoteInput[];
+  note?: string;
+}): Array<{
+  text: string;
+  selection: { x: number; y: number; width: number; height: number };
+}> {
+  if (Array.isArray(body.notes) && body.notes.length) {
+    return body.notes
+      .map((n, index) => {
+        const text = String(n?.text || "").trim();
+        if (!text) return null;
+        const s = n.selection || {};
+        return {
+          text: text.slice(0, 2000),
+          selection: {
+            x: Number(s.x ?? 12 + index * 8),
+            y: Number(s.y ?? 12 + index * 12),
+            width: Number(s.width ?? 24),
+            height: Number(s.height ?? 22),
+          },
+        };
+      })
+      .filter(Boolean) as Array<{
+      text: string;
+      selection: { x: number; y: number; width: number; height: number };
+    }>;
+  }
+
+  if (body.note) {
+    try {
+      const parsed = JSON.parse(body.note) as { notes?: NoteInput[] };
+      if (Array.isArray(parsed.notes)) {
+        return parseNotes({ notes: parsed.notes });
+      }
+    } catch {
+      const text = body.note.trim();
+      if (text) {
+        return [
+          {
+            text: text.slice(0, 2000),
+            selection: { x: 12, y: 12, width: 24, height: 22 },
+          },
+        ];
+      }
+    }
+  }
+  return [];
+}
+
 export const loader = async (_args: LoaderFunctionArgs) => {
   return json({ ok: true });
 };
@@ -70,57 +113,18 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     return json({ ok: false, error: "Method not allowed" }, 405);
   }
 
-  const secret = process.env.ACCOUNT_HMAC_SECRET;
-  const writeShops = (
-    process.env.ACCOUNT_WRITE_SHOPS ||
-    process.env.ACCOUNT_WRITE_SHOP ||
-    process.env.SHOP_CUSTOM_DOMAIN ||
-    process.env.SHOPIFY_SHOP ||
-    ""
-  )
-    .split(",")
-    .map((s) => s.trim().replace(/^https?:\/\//, "").replace(/\/$/, "").toLowerCase())
-    .filter(Boolean);
-
-  if (!secret) {
-    return json({ ok: false, error: "ACCOUNT_HMAC_SECRET not configured" }, 503);
-  }
-  if (!writeShops.length) {
-    return json(
-      {
-        ok: false,
-        error:
-          "Shop domain not configured (ACCOUNT_WRITE_SHOPS / ACCOUNT_WRITE_SHOP)",
-      },
-      503,
-    );
-  }
-
-  const timestamp = request.headers.get("X-Account-Timestamp") || "";
-  const signature = request.headers.get("X-Account-Signature") || "";
   const rawBody = await request.text();
-
-  const ts = Number(timestamp);
-  if (
-    !timestamp ||
-    !signature ||
-    !Number.isFinite(ts) ||
-    Math.abs(Math.floor(Date.now() / 1000) - ts) > MAX_SKEW_SEC
-  ) {
-    return json({ ok: false, error: "Invalid or expired signature" }, 401);
-  }
-
-  if (!verifyHmac(timestamp, rawBody, signature, secret)) {
-    return json({ ok: false, error: "Invalid signature" }, 401);
-  }
+  const hmac = assertAccountHmac(request, rawBody);
+  if (!hmac.ok) return json({ ok: false, error: hmac.error }, hmac.status);
 
   let body: {
-    type?: "review" | "gift" | "shipping";
+    type?: "review" | "gift" | "shipping" | "portrait_history";
     shop?: string;
     orderId?: string;
     customerId?: string;
     action?: "approve" | "modify";
     note?: string;
+    notes?: NoteInput[];
     orderName?: string;
     giftMessage?: {
       title?: string;
@@ -151,14 +155,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     );
   }
 
-  const requestedShop = (body.shop || "")
-    .trim()
-    .replace(/^https?:\/\//, "")
-    .replace(/\/$/, "")
-    .toLowerCase();
-  const shop = requestedShop
-    ? writeShops.find((s) => s === requestedShop)
-    : writeShops[0];
+  const shop = resolveAllowedShop(body.shop);
   if (!shop) {
     return json({ ok: false, error: "Shop not allowed" }, 403);
   }
@@ -172,6 +169,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
   }
 
   const ownerId = normalizeOrderGid(body.orderId);
+  const shopifyOrderId = orderNumericId(body.orderId);
   const customerGid = normalizeCustomerGid(body.customerId);
 
   const ownershipResponse = await admin.graphql(
@@ -179,6 +177,8 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     query OrderWriteGate($id: ID!) {
       order(id: $id) {
         id
+        name
+        email
         cancelledAt
         closedAt
         displayFulfillmentStatus
@@ -196,61 +196,125 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     return json({ ok: false, error: "Forbidden" }, 403);
   }
 
+  if (body.type === "portrait_history") {
+    const versions = await listPortraitVersions(shop, shopifyOrderId);
+    const requests = await listModificationRequests(shop, shopifyOrderId);
+    const index = await getSupplierOrder(shop, shopifyOrderId);
+    const enrichedVersions = await Promise.all(
+      versions.map(async (v) => ({
+        versionNumber: v.version_number,
+        imageUrl: await signedReadUrl(v.image_path),
+        videoUrl: v.video_path ? await signedReadUrl(v.video_path) : null,
+        createdAt: v.created_at,
+      })),
+    );
+    return json({
+      ok: true,
+      businessStatus: index?.business_status || (await getOrderBusinessStatus(admin, ownerId)),
+      versionCount: index?.version_count ?? versions.length,
+      modificationCount: index?.modification_count ?? requests.length,
+      versions: enrichedVersions,
+      modificationRequests: requests.map((r) => ({
+        againstVersion: r.against_version,
+        createdAt: r.created_at,
+        notes: r.notes.map((n) => ({
+          id: n.id,
+          text: n.text,
+          selection: {
+            x: Number(n.x),
+            y: Number(n.y),
+            width: Number(n.width),
+            height: Number(n.height),
+          },
+        })),
+      })),
+    });
+  }
+
   if (body.type === "review") {
     if (body.action !== "approve" && body.action !== "modify") {
       return json({ ok: false, error: "action must be approve or modify" }, 400);
     }
-    const reviewStatus =
-      body.action === "approve" ? "approved" : "modify_requested";
-    const reviewNote =
-      body.action === "modify" ? (body.note || "").slice(0, 2000) : "";
-    const updatedAt = new Date().toISOString();
-    const metafields: Array<{
-      ownerId: string;
-      namespace: string;
-      key: string;
-      type: string;
-      value: string;
-    }> = [
-      {
-        ownerId,
-        namespace: "custom",
-        key: "review_status",
-        type: "single_line_text_field",
-        value: reviewStatus,
-      },
-      {
-        ownerId,
-        namespace: "custom",
-        key: "review_updated_at",
-        type: "single_line_text_field",
-        value: updatedAt,
-      },
-    ];
-    if (body.action === "modify" && reviewNote) {
-      metafields.push({
-        ownerId,
-        namespace: "custom",
-        key: "review_note",
-        type: "multi_line_text_field",
-        value: reviewNote,
+
+    const current = await getOrderBusinessStatus(admin, ownerId);
+    let index = await getSupplierOrder(shop, shopifyOrderId);
+    if (!index) {
+      index = await upsertSupplierOrder({
+        shop,
+        shopifyOrderId,
+        orderName: order.name || body.orderName || `#${shopifyOrderId}`,
+        customerEmail: order.email || null,
+        businessStatus: current,
       });
     }
-    const response = await admin.graphql(
-      `#graphql
-      mutation SetReviewMetafields($metafields: [MetafieldsSetInput!]!) {
-        metafieldsSet(metafields: $metafields) {
-          userErrors { message field }
-        }
-      }`,
-      { variables: { metafields } },
-    );
-    const jsonBody = await response.json();
-    const errors = jsonBody.data?.metafieldsSet?.userErrors;
-    if (errors?.length) {
-      return json({ ok: false, error: errors[0].message }, 422);
+
+    if (body.action === "approve") {
+      const next: BusinessStatus = "prepare_shipment";
+      try {
+        assertTransition(current, next);
+      } catch {
+        return json(
+          { ok: false, error: `Cannot approve from status ${current}` },
+          409,
+        );
+      }
+      await setOrderBusinessStatus(admin, ownerId, next);
+      await setSupplierOrderStatus(shop, shopifyOrderId, next);
+      return json({
+        ok: true,
+        businessStatus: next,
+        orderId: ownerId,
+      });
     }
-    return json({ ok: true, reviewStatus, orderId: ownerId, updatedAt });
+
+    // modify
+    const next: BusinessStatus = "supplier_modification";
+    try {
+      assertTransition(current, next);
+    } catch {
+      return json(
+        { ok: false, error: `Cannot request modification from status ${current}` },
+        409,
+      );
+    }
+
+    const versionCount = index.version_count || 0;
+    if (!canRequestModification(versionCount)) {
+      return json(
+        {
+          ok: false,
+          error:
+            "Modification limit reached. Please approve the latest portrait.",
+        },
+        409,
+      );
+    }
+
+    const notes = parseNotes(body);
+    if (!notes.length) {
+      return json({ ok: false, error: "At least one modification note required" }, 400);
+    }
+
+    await insertModificationRequest({
+      shop,
+      shopifyOrderId,
+      againstVersion: versionCount,
+      notes,
+    });
+
+    const modificationCount = (index.modification_count || 0) + 1;
+    await setOrderBusinessStatus(admin, ownerId, next);
+    await setSupplierOrderStatus(shop, shopifyOrderId, next, {
+      modificationCount,
+    });
+
+    return json({
+      ok: true,
+      businessStatus: next,
+      orderId: ownerId,
+      againstVersion: versionCount,
+      noteCount: notes.length,
+    });
   }
 
   const editGate = isEditable(order);
