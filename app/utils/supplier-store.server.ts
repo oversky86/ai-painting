@@ -302,6 +302,32 @@ export async function listSupplierOrders(
   });
 }
 
+/** Counts that exist only in the database. Order name, status, and tracking stay on the Shopify order. */
+export async function supplierQueueExtras(
+  shop: string,
+  shopifyOrderIds: string[],
+): Promise<{
+  versionCount: Map<string, number>;
+  modificationCount: Map<string, number>;
+  latestNoteCount: Map<string, number>;
+}> {
+  const versionCount = new Map<string, number>();
+  const modificationCount = new Map<string, number>();
+  const latestNoteCount = new Map<string, number>();
+  if (!shopifyOrderIds.length) {
+    return { versionCount, modificationCount, latestNoteCount };
+  }
+  const versions = await listPortraitVersionsForOrders(shop, shopifyOrderIds);
+  for (const [orderId, list] of versions) versionCount.set(orderId, list.length);
+  const requests = await listModificationRequestsForOrders(shop, shopifyOrderIds);
+  for (const [orderId, list] of requests) {
+    modificationCount.set(orderId, list.length);
+    const latest = list[list.length - 1];
+    if (latest) latestNoteCount.set(orderId, latest.notes.length);
+  }
+  return { versionCount, modificationCount, latestNoteCount };
+}
+
 /** Note count of each order's most recent modification request. */
 export async function latestNoteCounts(
   shop: string,

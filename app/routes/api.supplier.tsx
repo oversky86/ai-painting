@@ -15,6 +15,8 @@ import {
   enableBusinessStatusCustomerRead,
   fetchOrderDetailForSupplier,
   getOrderBusinessStatus,
+  listShopifyOrdersForSupplier,
+  trackingFromFulfillments,
 } from "../utils/shopify-order.server";
 import {
   createUploadSignedUrl,
@@ -22,12 +24,11 @@ import {
   getSupplierOrder,
   insertPortraitVersion,
   isValidUploadPath,
-  latestNoteCounts,
   listModificationRequests,
   listPortraitVersions,
-  listSupplierOrders,
   reconcileSupplierOrder,
   signedReadUrls,
+  supplierQueueExtras,
   upsertSupplierOrder,
 } from "../utils/supplier-store.server";
 import { runTransition, TransitionAbort } from "../utils/status-transition.server";
@@ -90,29 +91,35 @@ export const action = async ({ request }: ActionFunctionArgs) => {
 
   if (actionType === "list_orders") {
     const tab = (body.tab as "action" | "waiting" | "done") || "action";
-    const rows = await listSupplierOrders(shop, tab);
-    const noteCounts = await latestNoteCounts(
-      shop,
-      rows
-        .filter((row) => row.business_status === "supplier_modification")
-        .map((row) => row.shopify_order_id),
-    );
-    return json({
-      ok: true,
-      tab,
-      orders: rows.map((row) => ({
-        id: row.shopify_order_id,
-        orderName: row.order_name,
-        email: row.customer_email,
-        businessStatus: row.business_status,
-        versionCount: row.version_count,
-        modificationCount: row.modification_count,
-        latestNoteCount: noteCounts.get(row.shopify_order_id) ?? 0,
-        placedAt: row.placed_at,
-        trackingCompany: row.tracking_company,
-        trackingNumber: row.tracking_number,
-      })),
-    });
+    try {
+      const rows = await listShopifyOrdersForSupplier(admin, tab);
+      const extras = await supplierQueueExtras(
+        shop,
+        rows.map((row) => row.id),
+      );
+      return json({
+        ok: true,
+        tab,
+        orders: rows.map((row) => ({
+          id: row.id,
+          orderName: row.orderName,
+          email: row.email,
+          businessStatus: row.businessStatus,
+          versionCount: extras.versionCount.get(row.id) ?? 0,
+          modificationCount: extras.modificationCount.get(row.id) ?? 0,
+          latestNoteCount: extras.latestNoteCount.get(row.id) ?? 0,
+          placedAt: row.placedAt,
+          trackingCompany: row.trackingCompany,
+          trackingNumber: row.trackingNumber,
+        })),
+      });
+    } catch (err) {
+      console.error("[supplier-api] list_orders failed", err);
+      return json(
+        { ok: false, error: err instanceof Error ? err.message : "订单加载失败" },
+        500,
+      );
+    }
   }
 
   const orderId = String(body.orderId || "");
@@ -152,6 +159,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
 
     const versions = await listPortraitVersions(shop, shopifyOrderId);
     const requests = await listModificationRequests(shop, shopifyOrderId);
+    const tracking = trackingFromFulfillments(shopifyOrder.fulfillments);
     const urls = await signedReadUrls(
       versions.flatMap((v) => [v.image_path, v.video_path || ""]),
     );
@@ -174,10 +182,10 @@ export const action = async ({ request }: ActionFunctionArgs) => {
         paintingStyle: shopifyOrder.paintingStyle?.value || null,
         giftMessage: shopifyOrder.giftMessage?.value || null,
         businessStatus,
-        versionCount: index.version_count,
-        modificationCount: index.modification_count,
-        trackingCompany: index.tracking_company,
-        trackingNumber: index.tracking_number,
+        versionCount: versions.length,
+        modificationCount: requests.length,
+        trackingCompany: tracking.company,
+        trackingNumber: tracking.number,
         versions: versions.map((v) => ({
           versionNumber: v.version_number,
           imageUrl: urls.get(v.image_path) || null,

@@ -274,6 +274,116 @@ export async function fetchOrderGates(
   );
 }
 
+export type SupplierQueueOrder = {
+  id: string;
+  orderName: string;
+  email: string | null;
+  businessStatus: BusinessStatus;
+  placedAt: string;
+  trackingCompany: string | null;
+  trackingNumber: string | null;
+};
+
+type TrackingInfo = { company?: string | null; number?: string | null };
+
+export function trackingFromFulfillments(
+  fulfillments: Array<{ trackingInfo?: TrackingInfo[] | null }> | null | undefined,
+): { company: string | null; number: string | null } {
+  for (const fulfillment of fulfillments || []) {
+    const info = (fulfillment.trackingInfo || []).find((item) => item.company || item.number);
+    if (info) return { company: info.company || null, number: info.number || null };
+  }
+  return { company: null, number: null };
+}
+
+const QUEUE_STATUSES: Record<"action" | "waiting" | "done", BusinessStatus[]> = {
+  action: ["order_placed", "supplier_modification", "prepare_shipment"],
+  waiting: ["portrait_review"],
+  done: ["shipped"],
+};
+
+/**
+ * Queue rows come from Shopify orders. Status is the order metafield.
+ * Portrait files and modification notes are not on the order, so callers add those from the database.
+ */
+export async function listShopifyOrdersForSupplier(
+  admin: AdminClient,
+  tab: "action" | "waiting" | "done",
+): Promise<SupplierQueueOrder[]> {
+  const wanted = new Set(QUEUE_STATUSES[tab] || QUEUE_STATUSES.action);
+  const rows: SupplierQueueOrder[] = [];
+  let cursor: string | null = null;
+
+  for (let page = 0; page < 8; page += 1) {
+    const response = await admin.graphql(
+      `#graphql
+      query SupplierOrderQueue($cursor: String, $query: String) {
+        orders(first: 50, after: $cursor, query: $query, sortKey: CREATED_AT) {
+          pageInfo { hasNextPage endCursor }
+          nodes {
+            id
+            name
+            email
+            createdAt
+            cancelledAt
+            businessStatus: metafield(namespace: "custom", key: "business_status") { value }
+            fulfillments(first: 5) {
+              trackingInfo { company number }
+            }
+          }
+        }
+      }`,
+      { variables: { cursor, query: "-status:cancelled" } },
+    );
+    const json = await response.json();
+    if (json?.errors?.length) {
+      throw new Error(json.errors[0].message || "Failed to list Shopify orders");
+    }
+    const connection = json?.data?.orders;
+    const nodes: Array<{
+      id: string;
+      name?: string | null;
+      email?: string | null;
+      createdAt: string;
+      cancelledAt?: string | null;
+      businessStatus?: { value?: string | null } | null;
+      fulfillments?: Array<{ trackingInfo?: TrackingInfo[] | null }> | null;
+    }> = connection?.nodes || [];
+
+    for (const node of nodes) {
+      if (!node?.id || node.cancelledAt) continue;
+      const businessStatus = normalizeBusinessStatus(node.businessStatus?.value);
+      if (!wanted.has(businessStatus)) continue;
+      const tracking = trackingFromFulfillments(node.fulfillments);
+      rows.push({
+        id: node.id.split("/").pop() || node.id,
+        orderName: node.name || "",
+        email: node.email || null,
+        businessStatus,
+        placedAt: node.createdAt,
+        trackingCompany: tracking.company,
+        trackingNumber: tracking.number,
+      });
+    }
+
+    if (!connection?.pageInfo?.hasNextPage) break;
+    cursor = connection.pageInfo.endCursor || null;
+  }
+
+  const priority: Record<string, number> = {
+    supplier_modification: 0,
+    prepare_shipment: 1,
+    order_placed: 2,
+    portrait_review: 3,
+    shipped: 4,
+  };
+  return rows.sort((a, b) => {
+    const diff = (priority[a.businessStatus] ?? 9) - (priority[b.businessStatus] ?? 9);
+    if (diff !== 0) return diff;
+    return a.placedAt.localeCompare(b.placedAt);
+  });
+}
+
 export async function fetchOrderDetailForSupplier(
   admin: AdminClient,
   orderGid: string,
@@ -314,6 +424,9 @@ export async function fetchOrderDetailForSupplier(
         }
         giftMessage: metafield(namespace: "custom", key: "gift_message") {
           value
+        }
+        fulfillments(first: 5) {
+          trackingInfo { company number }
         }
       }
     }`,
