@@ -6,8 +6,6 @@
 const ALLOWED_ORIGINS = [
   "https://pet-paiting-frontend.vercel.app",
   "https://e-commerce-dev-v6yidmlw.myshopify.com",
-  "https://w4yzmt-vv.myshopify.com",
-  "https://viewbrush.com",
   "http://localhost:3000",
   "http://localhost:3001",
 ];
