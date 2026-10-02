@@ -6,29 +6,30 @@ import {
   orderNumericId,
   resolveAllowedShop,
 } from "../utils/hmac-auth.server";
-import {
-  MAX_PORTRAIT_VERSIONS,
-  normalizeBusinessStatus,
-} from "../utils/business-status.server";
+import { MAX_PORTRAIT_VERSIONS } from "../utils/business-status.server";
 import {
   createOrderFulfillment,
+  effectiveBusinessStatus,
   enableBusinessStatusCustomerRead,
   fetchOrderDetailForSupplier,
-  getOrderBusinessStatus,
+  fetchOrderGate,
   listShopifyOrdersForSupplier,
+  orderBlockReason,
+  syncBusinessStatusMetafield,
   trackingFromFulfillments,
+  type OrderGate,
 } from "../utils/shopify-order.server";
 import {
   createUploadSignedUrl,
   deletePortraitVersion,
+  deleteStalePortraitRows,
   getSupplierOrder,
   insertPortraitVersion,
   isValidUploadPath,
-  listModificationRequests,
-  listPortraitVersions,
+  loadOrderPortraitProgress,
+  loadPortraitProgress,
   reconcileSupplierOrder,
   signedReadUrls,
-  supplierQueueExtras,
   upsertSupplierOrder,
 } from "../utils/supplier-store.server";
 import { runTransition, TransitionAbort } from "../utils/status-transition.server";
@@ -76,7 +77,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     return json({ ok: false, error: "Shop not allowed" }, 403);
   }
 
-  let admin;
+  let admin: Awaited<ReturnType<typeof unauthenticated.admin>>["admin"];
   try {
     ({ admin } = await unauthenticated.admin(shop));
   } catch (err) {
@@ -93,25 +94,29 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     const tab = (body.tab as "action" | "waiting" | "done") || "action";
     try {
       const rows = await listShopifyOrdersForSupplier(admin, tab);
-      const extras = await supplierQueueExtras(
+      const progress = await loadPortraitProgress(
         shop,
-        rows.map((row) => row.id),
+        rows.map((row) => ({ shopifyOrderId: row.id, businessStatus: row.businessStatus })),
       );
       return json({
         ok: true,
         tab,
-        orders: rows.map((row) => ({
-          id: row.id,
-          orderName: row.orderName,
-          email: row.email,
-          businessStatus: row.businessStatus,
-          versionCount: extras.versionCount.get(row.id) ?? 0,
-          modificationCount: extras.modificationCount.get(row.id) ?? 0,
-          latestNoteCount: extras.latestNoteCount.get(row.id) ?? 0,
-          placedAt: row.placedAt,
-          trackingCompany: row.trackingCompany,
-          trackingNumber: row.trackingNumber,
-        })),
+        orders: rows.map((row) => {
+          const p = progress.get(row.id);
+          const latestRequest = p?.requests[p.requests.length - 1];
+          return {
+            id: row.id,
+            orderName: row.orderName,
+            email: row.email,
+            businessStatus: row.businessStatus,
+            versionCount: p?.versionCount ?? 0,
+            modificationCount: p?.modificationCount ?? 0,
+            latestNoteCount: latestRequest?.notes.length ?? 0,
+            placedAt: row.placedAt,
+            trackingCompany: row.trackingCompany,
+            trackingNumber: row.trackingNumber,
+          };
+        }),
       });
     } catch (err) {
       console.error("[supplier-api] list_orders failed", err);
@@ -127,14 +132,25 @@ export const action = async ({ request }: ActionFunctionArgs) => {
   const shopifyOrderId = orderNumericId(orderId);
   const ownerId = normalizeOrderGid(orderId);
 
-  async function loadIndex(current: ReturnType<typeof normalizeBusinessStatus>) {
+  async function loadIndex(gate: OrderGate) {
     const existing = await getSupplierOrder(shop!, shopifyOrderId);
     if (existing) return existing;
     return upsertSupplierOrder({
       shop: shop!,
       shopifyOrderId,
-      businessStatus: current,
+      orderName: gate.name,
+      customerEmail: gate.email,
+      businessStatus: gate.businessStatus,
+      placedAt: gate.createdAt,
     });
+  }
+
+  /** Live Shopify state for write actions; a Response when the order may not be worked on. */
+  async function loadWritableGate(): Promise<OrderGate | Response> {
+    const gate = await fetchOrderGate(admin, ownerId);
+    if (!gate) return json({ ok: false, error: "Order not found" }, 404);
+    if (gate.blockReason) return json({ ok: false, error: gate.blockReason }, 409);
+    return gate;
   }
 
   if (actionType === "order_detail") {
@@ -142,7 +158,12 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     if (!shopifyOrder) {
       return json({ ok: false, error: "Order not found" }, 404);
     }
-    const businessStatus = normalizeBusinessStatus(shopifyOrder.businessStatus?.value);
+    const metafieldStatus = shopifyOrder.businessStatus?.value || null;
+    const businessStatus = effectiveBusinessStatus(
+      metafieldStatus,
+      shopifyOrder.displayFulfillmentStatus,
+    );
+    await syncBusinessStatusMetafield(admin, { id: ownerId, metafieldStatus, businessStatus });
 
     let index = await getSupplierOrder(shop, shopifyOrderId);
     if (!index) {
@@ -155,13 +176,12 @@ export const action = async ({ request }: ActionFunctionArgs) => {
         placedAt: shopifyOrder.createdAt,
       });
     }
-    index = await reconcileSupplierOrder(index, businessStatus);
+    await reconcileSupplierOrder(index, businessStatus);
 
-    const versions = await listPortraitVersions(shop, shopifyOrderId);
-    const requests = await listModificationRequests(shop, shopifyOrderId);
+    const progress = await loadOrderPortraitProgress(shop, shopifyOrderId, businessStatus);
     const tracking = trackingFromFulfillments(shopifyOrder.fulfillments);
     const urls = await signedReadUrls(
-      versions.flatMap((v) => [v.image_path, v.video_path || ""]),
+      progress.versions.flatMap((v) => [v.image_path, v.video_path || ""]),
     );
 
     return json({
@@ -174,6 +194,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
         createdAt: shopifyOrder.createdAt,
         financialStatus: shopifyOrder.displayFinancialStatus,
         fulfillmentStatus: shopifyOrder.displayFulfillmentStatus,
+        blockedReason: orderBlockReason(shopifyOrder),
         total: shopifyOrder.totalPriceSet?.shopMoney,
         shippingAddress: shopifyOrder.shippingAddress,
         lineItems: shopifyOrder.lineItems?.nodes || [],
@@ -182,17 +203,18 @@ export const action = async ({ request }: ActionFunctionArgs) => {
         paintingStyle: shopifyOrder.paintingStyle?.value || null,
         giftMessage: shopifyOrder.giftMessage?.value || null,
         businessStatus,
-        versionCount: versions.length,
-        modificationCount: requests.length,
+        versionCount: progress.versionCount,
+        modificationCount: progress.modificationCount,
+        nextVersion: progress.nextVersion,
         trackingCompany: tracking.company,
         trackingNumber: tracking.number,
-        versions: versions.map((v) => ({
+        versions: progress.versions.map((v) => ({
           versionNumber: v.version_number,
           imageUrl: urls.get(v.image_path) || null,
           videoUrl: v.video_path ? urls.get(v.video_path) || null : null,
           createdAt: v.created_at,
         })),
-        modificationRequests: requests.map((r) => ({
+        modificationRequests: progress.requests.map((r) => ({
           againstVersion: r.against_version,
           createdAt: r.created_at,
           notes: r.notes.map((n) => ({
@@ -218,13 +240,14 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       return json({ ok: false, error: `Unsupported ${kind} type: ${contentType || "unknown"}` }, 400);
     }
 
-    const current = await getOrderBusinessStatus(admin, ownerId);
+    const gate = await loadWritableGate();
+    if (gate instanceof Response) return gate;
+    const current = gate.businessStatus;
     if (current !== "order_placed" && current !== "supplier_modification") {
       return json({ ok: false, error: `Cannot upload in status ${current}` }, 409);
     }
 
-    const index = await loadIndex(current);
-    const nextVersion = (index.version_count || 0) + 1;
+    const { nextVersion } = await loadOrderPortraitProgress(shop, shopifyOrderId, current);
     if (nextVersion > MAX_PORTRAIT_VERSIONS) {
       return json({ ok: false, error: "Maximum portrait versions reached" }, 409);
     }
@@ -255,9 +278,11 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       );
     }
 
-    const current = await getOrderBusinessStatus(admin, ownerId);
-    const index = await loadIndex(current);
-    const nextVersion = (index.version_count || 0) + 1;
+    const gate = await loadWritableGate();
+    if (gate instanceof Response) return gate;
+    const current = gate.businessStatus;
+    const progress = await loadOrderPortraitProgress(shop, shopifyOrderId, current);
+    const nextVersion = progress.nextVersion;
     if (nextVersion > MAX_PORTRAIT_VERSIONS) {
       return json({ ok: false, error: "Maximum portrait versions reached" }, 409);
     }
@@ -277,21 +302,23 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       );
     }
 
+    const index = await loadIndex(gate);
     const outcome = await runTransition({
       admin,
       ownerId,
       index,
       current,
       next: "portrait_review",
-      extra: { versionCount: nextVersion },
-      apply: () =>
-        insertPortraitVersion({
+      apply: async () => {
+        await deleteStalePortraitRows(progress);
+        return insertPortraitVersion({
           shop,
           shopifyOrderId,
           versionNumber: nextVersion,
           imagePath,
           videoPath,
-        }),
+        });
+      },
       undo: (version) => deletePortraitVersion(version.id),
     });
     if (!outcome.ok) return json({ ok: false, error: outcome.error }, outcome.status);
@@ -313,8 +340,13 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       );
     }
 
-    const current = await getOrderBusinessStatus(admin, ownerId);
-    const index = await loadIndex(current);
+    const gate = await loadWritableGate();
+    if (gate instanceof Response) return gate;
+    if (gate.businessStatus === "shipped") {
+      await syncBusinessStatusMetafield(admin, gate);
+      return json({ ok: false, error: "This order is already fulfilled in Shopify." }, 409);
+    }
+    const index = await loadIndex(gate);
     const tracking = { company, number };
 
     // Retrying after a failed status write is safe: fulfillment skips closed fulfillment orders.
@@ -322,9 +354,8 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       admin,
       ownerId,
       index,
-      current,
+      current: gate.businessStatus,
       next: "shipped",
-      extra: { trackingCompany: company, trackingNumber: number },
       irreversible: true,
       apply: async () => {
         try {

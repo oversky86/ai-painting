@@ -107,12 +107,13 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       const json = await response.json();
       const errors = json.data?.metafieldsSet?.userErrors;
       if (errors?.length) {
+        // A 5xx makes Shopify redeliver; the handler is safe to rerun (see existingStatus above).
         console.error(`[Webhook] metafieldsSet errors:`, errors);
-      } else {
-        console.log(
-          `[Webhook] Order ${orderPayload.id} business_status=${businessStatus}`,
-        );
+        return new Response("metafieldsSet failed", { status: 500 });
       }
+      console.log(
+        `[Webhook] Order ${orderPayload.id} business_status=${businessStatus}`,
+      );
     } else {
       console.error(
         "[Webhook] No admin session — cannot set metafields; still indexing",
@@ -133,6 +134,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     }
   } catch (error) {
     console.error("[Webhook] Order processing error:", error);
+    return new Response("Order processing failed", { status: 500 });
   }
 
   return new Response();

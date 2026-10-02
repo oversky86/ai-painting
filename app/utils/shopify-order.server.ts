@@ -15,6 +15,102 @@ export async function getOrderBusinessStatus(
   return normalizeBusinessStatus(await readOrderBusinessStatusValue(admin, orderGid));
 }
 
+/** A fully fulfilled order is shipped, whoever fulfilled it (our ship action or Shopify admin). */
+export function effectiveBusinessStatus(
+  metafieldValue: string | null | undefined,
+  displayFulfillmentStatus: string | null | undefined,
+): BusinessStatus {
+  if ((displayFulfillmentStatus || "").toUpperCase() === "FULFILLED") return "shipped";
+  return normalizeBusinessStatus(metafieldValue);
+}
+
+const BLOCKED_FINANCIAL_STATUSES = new Set(["REFUNDED", "VOIDED"]);
+
+/** Why no portrait or review work may happen on this order, or null when it may. */
+export function orderBlockReason(order: {
+  cancelledAt?: string | null;
+  displayFinancialStatus?: string | null;
+}): string | null {
+  if (order.cancelledAt) return "This order was cancelled.";
+  if (BLOCKED_FINANCIAL_STATUSES.has((order.displayFinancialStatus || "").toUpperCase())) {
+    return "This order was refunded.";
+  }
+  return null;
+}
+
+export type OrderGate = {
+  id: string;
+  name: string;
+  email: string | null;
+  createdAt: string;
+  customerId: string | null;
+  cancelledAt: string | null;
+  displayFinancialStatus: string | null;
+  displayFulfillmentStatus: string | null;
+  /** Raw metafield value. */
+  metafieldStatus: string | null;
+  businessStatus: BusinessStatus;
+  blockReason: string | null;
+};
+
+/** Live order state for one order; null when Shopify doesn't return the order. */
+export async function fetchOrderGate(
+  admin: AdminClient,
+  orderGid: string,
+): Promise<OrderGate | null> {
+  const response = await admin.graphql(
+    `#graphql
+    query OrderGate($id: ID!) {
+      order(id: $id) {
+        id
+        name
+        email
+        createdAt
+        cancelledAt
+        displayFinancialStatus
+        displayFulfillmentStatus
+        customer { id }
+        businessStatus: metafield(namespace: "custom", key: "business_status") {
+          value
+        }
+      }
+    }`,
+    { variables: { id: orderGid } },
+  );
+  const json = await response.json();
+  if (json?.errors?.length) {
+    throw new Error(json.errors[0].message || "Failed to load Shopify order");
+  }
+  const order = json?.data?.order;
+  if (!order?.id) return null;
+  const metafieldStatus = order.businessStatus?.value || null;
+  return {
+    id: order.id,
+    name: order.name || "",
+    email: order.email || null,
+    createdAt: order.createdAt,
+    customerId: order.customer?.id || null,
+    cancelledAt: order.cancelledAt || null,
+    displayFinancialStatus: order.displayFinancialStatus || null,
+    displayFulfillmentStatus: order.displayFulfillmentStatus || null,
+    metafieldStatus,
+    businessStatus: effectiveBusinessStatus(metafieldStatus, order.displayFulfillmentStatus),
+    blockReason: orderBlockReason(order),
+  };
+}
+
+/** Best-effort: brings a stale metafield in line with the effective status (e.g. fulfilled in Shopify admin). */
+export async function syncBusinessStatusMetafield(
+  admin: AdminClient,
+  gate: Pick<OrderGate, "id" | "metafieldStatus" | "businessStatus">,
+): Promise<void> {
+  if (gate.metafieldStatus === gate.businessStatus) return;
+  if (gate.businessStatus !== "shipped") return;
+  await setOrderBusinessStatus(admin, gate.id, "shipped").catch((err) =>
+    console.error("[shopify-order] status sync failed", gate.id, err),
+  );
+}
+
 /** Raw metafield value; null when the order has never been given a status. */
 export async function readOrderBusinessStatusValue(
   admin: AdminClient,
@@ -135,13 +231,14 @@ const DONE_FULFILLMENT_ORDER_STATUSES = new Set(["CLOSED", "CANCELLED"]);
  * Fulfills every remaining fulfillment order on the order. Fulfillment orders
  * can sit at different locations and one fulfillmentCreate call only accepts a
  * single location, so each is fulfilled separately. Safe to call again after a
- * partial failure: closed fulfillment orders are skipped.
+ * partial failure: closed fulfillment orders are skipped. Throws when nothing
+ * was or could be fulfilled (for example, every fulfillment order was cancelled).
  */
 export async function createOrderFulfillment(
   admin: AdminClient,
   orderGid: string,
   tracking: { company: string; number: string },
-): Promise<{ fulfilledCount: number }> {
+): Promise<{ fulfilledCount: number; alreadyFulfilled: boolean }> {
   const foResponse = await admin.graphql(
     `#graphql
     query OrderFulfillmentOrders($id: ID!) {
@@ -221,7 +318,11 @@ export async function createOrderFulfillment(
     }
     fulfilledCount += 1;
   }
-  return { fulfilledCount };
+  if (fulfilledCount > 0) return { fulfilledCount, alreadyFulfilled: false };
+  if (fulfillmentOrders.some((fo) => fo.status === "CLOSED")) {
+    return { fulfilledCount: 0, alreadyFulfilled: true };
+  }
+  throw new Error("Nothing left to fulfill on this order. Check it in Shopify admin.");
 }
 
 export type CustomerOrderGate = {
@@ -244,6 +345,7 @@ export async function fetchOrderGates(
         ... on Order {
           id
           name
+          displayFulfillmentStatus
           customer { id }
           businessStatus: metafield(namespace: "custom", key: "business_status") {
             value
@@ -257,6 +359,7 @@ export async function fetchOrderGates(
   const nodes: Array<{
     id?: string;
     name?: string;
+    displayFulfillmentStatus?: string | null;
     customer?: { id: string } | null;
     businessStatus?: { value?: string | null } | null;
   } | null> = json?.data?.nodes || [];
@@ -267,7 +370,10 @@ export async function fetchOrderGates(
             id: node.id,
             name: node.name || "",
             customerId: node.customer?.id || null,
-            businessStatus: normalizeBusinessStatus(node.businessStatus?.value),
+            businessStatus: effectiveBusinessStatus(
+              node.businessStatus?.value,
+              node.displayFulfillmentStatus,
+            ),
           },
         ]
       : [],
@@ -296,29 +402,57 @@ export function trackingFromFulfillments(
   return { company: null, number: null };
 }
 
-const QUEUE_STATUSES: Record<"action" | "waiting" | "done", BusinessStatus[]> = {
-  action: ["order_placed", "supplier_modification", "prepare_shipment"],
-  waiting: ["portrait_review"],
-  done: ["shipped"],
+type QueueTab = "action" | "waiting" | "done";
+
+const OPEN_WORK_QUERY =
+  "-status:cancelled -fulfillment_status:fulfilled -financial_status:refunded -financial_status:voided";
+
+/**
+ * Open tabs scan unfulfilled, unrefunded orders oldest first so nothing waiting
+ * drops off; the done tab shows the most recent fulfilled orders.
+ */
+const QUEUE_TABS: Record<
+  QueueTab,
+  { statuses: BusinessStatus[]; query: string; reverse: boolean; pages: number }
+> = {
+  action: {
+    statuses: ["order_placed", "supplier_modification", "prepare_shipment"],
+    query: OPEN_WORK_QUERY,
+    reverse: false,
+    pages: 8,
+  },
+  waiting: {
+    statuses: ["portrait_review"],
+    query: OPEN_WORK_QUERY,
+    reverse: false,
+    pages: 8,
+  },
+  done: {
+    statuses: ["shipped"],
+    query: "-status:cancelled fulfillment_status:fulfilled",
+    reverse: true,
+    pages: 2,
+  },
 };
 
 /**
- * Queue rows come from Shopify orders. Status is the order metafield.
+ * Queue rows come from Shopify orders. Status is the order metafield, or shipped once fulfilled.
  * Portrait files and modification notes are not on the order, so callers add those from the database.
  */
 export async function listShopifyOrdersForSupplier(
   admin: AdminClient,
-  tab: "action" | "waiting" | "done",
+  tab: QueueTab,
 ): Promise<SupplierQueueOrder[]> {
-  const wanted = new Set(QUEUE_STATUSES[tab] || QUEUE_STATUSES.action);
+  const config = QUEUE_TABS[tab] || QUEUE_TABS.action;
+  const wanted = new Set(config.statuses);
   const rows: SupplierQueueOrder[] = [];
   let cursor: string | null = null;
 
-  for (let page = 0; page < 8; page += 1) {
+  for (let page = 0; page < config.pages; page += 1) {
     const response = await admin.graphql(
       `#graphql
-      query SupplierOrderQueue($cursor: String, $query: String) {
-        orders(first: 50, after: $cursor, query: $query, sortKey: CREATED_AT) {
+      query SupplierOrderQueue($cursor: String, $query: String, $reverse: Boolean) {
+        orders(first: 50, after: $cursor, query: $query, sortKey: CREATED_AT, reverse: $reverse) {
           pageInfo { hasNextPage endCursor }
           nodes {
             id
@@ -326,6 +460,7 @@ export async function listShopifyOrdersForSupplier(
             email
             createdAt
             cancelledAt
+            displayFulfillmentStatus
             businessStatus: metafield(namespace: "custom", key: "business_status") { value }
             fulfillments(first: 5) {
               trackingInfo { company number }
@@ -333,7 +468,7 @@ export async function listShopifyOrdersForSupplier(
           }
         }
       }`,
-      { variables: { cursor, query: "-status:cancelled" } },
+      { variables: { cursor, query: config.query, reverse: config.reverse } },
     );
     const json = await response.json();
     if (json?.errors?.length) {
@@ -346,13 +481,17 @@ export async function listShopifyOrdersForSupplier(
       email?: string | null;
       createdAt: string;
       cancelledAt?: string | null;
+      displayFulfillmentStatus?: string | null;
       businessStatus?: { value?: string | null } | null;
       fulfillments?: Array<{ trackingInfo?: TrackingInfo[] | null }> | null;
     }> = connection?.nodes || [];
 
     for (const node of nodes) {
       if (!node?.id || node.cancelledAt) continue;
-      const businessStatus = normalizeBusinessStatus(node.businessStatus?.value);
+      const businessStatus = effectiveBusinessStatus(
+        node.businessStatus?.value,
+        node.displayFulfillmentStatus,
+      );
       if (!wanted.has(businessStatus)) continue;
       const tracking = trackingFromFulfillments(node.fulfillments);
       rows.push({
@@ -380,7 +519,8 @@ export async function listShopifyOrdersForSupplier(
   return rows.sort((a, b) => {
     const diff = (priority[a.businessStatus] ?? 9) - (priority[b.businessStatus] ?? 9);
     if (diff !== 0) return diff;
-    return a.placedAt.localeCompare(b.placedAt);
+    const byDate = a.placedAt.localeCompare(b.placedAt);
+    return config.reverse ? -byDate : byDate;
   });
 }
 
@@ -396,6 +536,7 @@ export async function fetchOrderDetailForSupplier(
         name
         email
         createdAt
+        cancelledAt
         displayFinancialStatus
         displayFulfillmentStatus
         totalPriceSet { shopMoney { amount currencyCode } }

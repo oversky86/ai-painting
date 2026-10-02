@@ -7,15 +7,18 @@ import {
   orderNumericId,
   resolveAllowedShop,
 } from "../utils/hmac-auth.server";
+import { canRequestModification } from "../utils/business-status.server";
 import {
-  canRequestModification,
-  normalizeBusinessStatus,
-} from "../utils/business-status.server";
-import { fetchOrderGates } from "../utils/shopify-order.server";
+  effectiveBusinessStatus,
+  fetchOrderGates,
+  orderBlockReason,
+} from "../utils/shopify-order.server";
 import {
   deleteModificationRequest,
+  deleteStalePortraitRows,
   getSupplierOrder,
   insertModificationRequest,
+  loadOrderPortraitProgress,
   upsertSupplierOrder,
 } from "../utils/supplier-store.server";
 import { buildPortraitHistories } from "../utils/portrait-history.server";
@@ -204,6 +207,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
         email
         cancelledAt
         closedAt
+        displayFinancialStatus
         displayFulfillmentStatus
         customer { id }
         businessStatus: metafield(namespace: "custom", key: "business_status") {
@@ -222,8 +226,12 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     return json({ ok: false, error: "Forbidden" }, 403);
   }
 
+  const current = effectiveBusinessStatus(
+    order.businessStatus?.value,
+    order.displayFulfillmentStatus,
+  );
+
   if (body.type === "portrait_history") {
-    const current = normalizeBusinessStatus(order.businessStatus?.value);
     const histories = await buildPortraitHistories(shop, [
       { shopifyOrderId, businessStatus: current },
     ]);
@@ -235,7 +243,9 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       return json({ ok: false, error: "action must be approve or modify" }, 400);
     }
 
-    const current = normalizeBusinessStatus(order.businessStatus?.value);
+    const blockReason = orderBlockReason(order);
+    if (blockReason) return json({ ok: false, error: blockReason }, 409);
+
     let index = await getSupplierOrder(shop, shopifyOrderId);
     if (!index) {
       index = await upsertSupplierOrder({
@@ -245,6 +255,14 @@ export const action = async ({ request }: ActionFunctionArgs) => {
         customerEmail: order.email || null,
         businessStatus: current,
       });
+    }
+    const progress = await loadOrderPortraitProgress(shop, shopifyOrderId, current);
+    const versionCount = progress.versionCount;
+    if (current === "portrait_review" && versionCount === 0) {
+      return json(
+        { ok: false, error: "No portrait has been uploaded for this order yet." },
+        409,
+      );
     }
 
     if (body.action === "approve") {
@@ -259,7 +277,6 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       return json({ ok: true, businessStatus: "prepare_shipment", orderId: ownerId });
     }
 
-    const versionCount = index.version_count || 0;
     if (current === "portrait_review" && !canRequestModification(versionCount)) {
       return json(
         {
@@ -282,14 +299,15 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       index,
       current,
       next: "supplier_modification",
-      extra: { modificationCount: (index.modification_count || 0) + 1 },
-      apply: () =>
-        insertModificationRequest({
+      apply: async () => {
+        await deleteStalePortraitRows(progress);
+        return insertModificationRequest({
           shop,
           shopifyOrderId,
           againstVersion: versionCount,
           notes,
-        }),
+        });
+      },
       undo: (created) => deleteModificationRequest(created.request.id),
     });
     if (!outcome.ok) return json({ ok: false, error: outcome.error }, outcome.status);

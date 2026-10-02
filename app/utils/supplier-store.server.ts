@@ -1,8 +1,9 @@
 import { createClient, type SupabaseClient } from "@supabase/supabase-js";
+import type { BusinessStatus } from "./business-status.server";
 import {
-  type BusinessStatus,
-  normalizeBusinessStatus,
-} from "./business-status.server";
+  type PortraitProgress,
+  resolvePortraitProgress,
+} from "./portrait-progress.server";
 
 const BUCKET = "supplier-portraits";
 const SIGNED_URL_TTL_SEC = 60 * 60; // 1 hour
@@ -158,69 +159,39 @@ export async function getSupplierOrders(
   return (data || []) as SupplierOrderRow[];
 }
 
-type StatusExtra = {
-  versionCount?: number;
-  modificationCount?: number;
-  trackingCompany?: string | null;
-  trackingNumber?: string | null;
-};
-
-function statusPatch(status: BusinessStatus, extra?: StatusExtra) {
-  const patch: Record<string, unknown> = {
-    business_status: status,
-    updated_at: new Date().toISOString(),
-  };
-  if (extra?.versionCount !== undefined) patch.version_count = extra.versionCount;
-  if (extra?.modificationCount !== undefined) {
-    patch.modification_count = extra.modificationCount;
-  }
-  if (extra?.trackingCompany !== undefined) {
-    patch.tracking_company = extra.trackingCompany;
-  }
-  if (extra?.trackingNumber !== undefined) {
-    patch.tracking_number = extra.trackingNumber;
-  }
-  return patch;
+function statusPatch(status: BusinessStatus) {
+  return { business_status: status, updated_at: new Date().toISOString() };
 }
 
 /**
  * Compare-and-set on the index row: only moves `from -> to` when the row still
- * holds `from` (and the expected counters). Returns null when another request won.
+ * holds `from`. Every transition changes the status, so this alone serializes
+ * concurrent requests. Returns null when another request won.
  */
 export async function claimStatus(input: {
   row: SupplierOrderRow;
   from: BusinessStatus;
   to: BusinessStatus;
-  extra?: StatusExtra;
 }): Promise<SupplierOrderRow | null> {
   const sb = getClient();
   const { data, error } = await sb
     .from("supplier_orders")
-    .update(statusPatch(input.to, input.extra))
+    .update(statusPatch(input.to))
     .eq("id", input.row.id)
     .eq("business_status", input.from)
-    .eq("version_count", input.row.version_count)
-    .eq("modification_count", input.row.modification_count)
     .select("*");
   if (error) throw new Error(error.message);
   return ((data || [])[0] as SupplierOrderRow | undefined) || null;
 }
 
-/** Puts a claimed row back to its pre-claim snapshot. */
+/** Puts a claimed row back to its pre-claim status. */
 export async function restoreSupplierOrder(
   snapshot: SupplierOrderRow,
 ): Promise<void> {
   const sb = getClient();
   const { error } = await sb
     .from("supplier_orders")
-    .update({
-      business_status: snapshot.business_status,
-      version_count: snapshot.version_count,
-      modification_count: snapshot.modification_count,
-      tracking_company: snapshot.tracking_company,
-      tracking_number: snapshot.tracking_number,
-      updated_at: new Date().toISOString(),
-    })
+    .update(statusPatch(snapshot.business_status as BusinessStatus))
     .eq("id", snapshot.id);
   if (error) {
     console.error("[supplier-store] restore failed", snapshot.id, error.message);
@@ -264,83 +235,54 @@ export async function getSupplierOrder(
   return (data as SupplierOrderRow | null) || null;
 }
 
-export async function listSupplierOrders(
+/** Portrait progress for many orders. Order name, status, and tracking stay on the Shopify order. */
+export async function loadPortraitProgress(
   shop: string,
-  tab: "action" | "waiting" | "done",
-): Promise<SupplierOrderRow[]> {
+  orders: Array<{ shopifyOrderId: string; businessStatus: BusinessStatus }>,
+): Promise<Map<string, PortraitProgress>> {
+  const ids = orders.map((o) => o.shopifyOrderId);
+  const [versionsByOrder, requestsByOrder] = await Promise.all([
+    listPortraitVersionsForOrders(shop, ids),
+    listModificationRequestsForOrders(shop, ids),
+  ]);
+  return new Map(
+    orders.map((o) => [
+      o.shopifyOrderId,
+      resolvePortraitProgress(
+        o.businessStatus,
+        versionsByOrder.get(o.shopifyOrderId) || [],
+        requestsByOrder.get(o.shopifyOrderId) || [],
+      ),
+    ]),
+  );
+}
+
+export async function loadOrderPortraitProgress(
+  shop: string,
+  shopifyOrderId: string,
+  businessStatus: BusinessStatus,
+): Promise<PortraitProgress> {
+  const progress = await loadPortraitProgress(shop, [{ shopifyOrderId, businessStatus }]);
+  return progress.get(shopifyOrderId)!;
+}
+
+/** Removes rows left over from rolled-back transitions so the next insert can reuse their version slot. */
+export async function deleteStalePortraitRows(progress: PortraitProgress): Promise<void> {
   const sb = getClient();
-  let statuses: BusinessStatus[];
-  if (tab === "action") {
-    statuses = ["order_placed", "supplier_modification", "prepare_shipment"];
-  } else if (tab === "waiting") {
-    statuses = ["portrait_review"];
-  } else {
-    statuses = ["shipped"];
+  if (progress.staleVersionIds.length) {
+    const { error } = await sb
+      .from("portrait_versions")
+      .delete()
+      .in("id", progress.staleVersionIds);
+    if (error) throw new Error(error.message);
   }
-
-  const { data, error } = await sb
-    .from("supplier_orders")
-    .select("*")
-    .eq("shop", shop)
-    .in("business_status", statuses)
-    .order("placed_at", { ascending: true });
-  if (error) throw new Error(error.message);
-
-  const rows = (data || []) as SupplierOrderRow[];
-  const priority: Record<string, number> = {
-    supplier_modification: 0,
-    prepare_shipment: 1,
-    order_placed: 2,
-    portrait_review: 3,
-    shipped: 4,
-  };
-  return rows.sort((a, b) => {
-    const pa = priority[a.business_status] ?? 9;
-    const pb = priority[b.business_status] ?? 9;
-    if (pa !== pb) return pa - pb;
-    return a.placed_at.localeCompare(b.placed_at);
-  });
-}
-
-/** Counts that exist only in the database. Order name, status, and tracking stay on the Shopify order. */
-export async function supplierQueueExtras(
-  shop: string,
-  shopifyOrderIds: string[],
-): Promise<{
-  versionCount: Map<string, number>;
-  modificationCount: Map<string, number>;
-  latestNoteCount: Map<string, number>;
-}> {
-  const versionCount = new Map<string, number>();
-  const modificationCount = new Map<string, number>();
-  const latestNoteCount = new Map<string, number>();
-  if (!shopifyOrderIds.length) {
-    return { versionCount, modificationCount, latestNoteCount };
+  if (progress.staleRequestIds.length) {
+    const { error } = await sb
+      .from("modification_requests")
+      .delete()
+      .in("id", progress.staleRequestIds);
+    if (error) throw new Error(error.message);
   }
-  const versions = await listPortraitVersionsForOrders(shop, shopifyOrderIds);
-  for (const [orderId, list] of versions) versionCount.set(orderId, list.length);
-  const requests = await listModificationRequestsForOrders(shop, shopifyOrderIds);
-  for (const [orderId, list] of requests) {
-    modificationCount.set(orderId, list.length);
-    const latest = list[list.length - 1];
-    if (latest) latestNoteCount.set(orderId, latest.notes.length);
-  }
-  return { versionCount, modificationCount, latestNoteCount };
-}
-
-/** Note count of each order's most recent modification request. */
-export async function latestNoteCounts(
-  shop: string,
-  shopifyOrderIds: string[],
-): Promise<Map<string, number>> {
-  const counts = new Map<string, number>();
-  if (!shopifyOrderIds.length) return counts;
-  const requests = await listModificationRequestsForOrders(shop, shopifyOrderIds);
-  for (const [orderId, list] of requests) {
-    const latest = list[list.length - 1];
-    if (latest) counts.set(orderId, latest.notes.length);
-  }
-  return counts;
 }
 
 const UPLOAD_FILE_PATTERN = {
@@ -675,10 +617,4 @@ export async function getLoginLock(ip: string): Promise<{
     lockedUntil: null,
     failCount: data.fail_count || 0,
   };
-}
-
-export function currentBusinessStatus(
-  row: SupplierOrderRow | null,
-): BusinessStatus {
-  return normalizeBusinessStatus(row?.business_status);
 }

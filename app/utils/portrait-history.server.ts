@@ -1,8 +1,7 @@
 import type { BusinessStatus } from "./business-status.server";
 import {
   getSupplierOrders,
-  listModificationRequestsForOrders,
-  listPortraitVersionsForOrders,
+  loadPortraitProgress,
   reconcileSupplierOrder,
   signedReadUrls,
 } from "./supplier-store.server";
@@ -30,50 +29,47 @@ export type PortraitHistory = {
 
 /**
  * Versions and notes for many orders with a fixed number of Supabase calls.
- * `businessStatus` comes from the metafield (source of truth); drifted index
- * rows are reconciled on the way.
+ * `businessStatus` comes from Shopify (source of truth); counts come from the
+ * version and request rows, and drifted index rows are reconciled on the way.
  */
 export async function buildPortraitHistories(
   shop: string,
   orders: Array<{ shopifyOrderId: string; businessStatus: BusinessStatus }>,
 ): Promise<Map<string, PortraitHistory>> {
   const ids = orders.map((o) => o.shopifyOrderId);
-  const [indexRows, versionsByOrder, requestsByOrder] = await Promise.all([
+  const [indexRows, progressByOrder] = await Promise.all([
     getSupplierOrders(shop, ids),
-    listPortraitVersionsForOrders(shop, ids),
-    listModificationRequestsForOrders(shop, ids),
+    loadPortraitProgress(shop, orders),
   ]);
-  const indexById = new Map(indexRows.map((row) => [row.shopify_order_id, row]));
+  const statusById = new Map(orders.map((o) => [o.shopifyOrderId, o.businessStatus]));
 
   const urls = await signedReadUrls(
-    [...versionsByOrder.values()].flat().flatMap((v) => [v.image_path, v.video_path || ""]),
+    [...progressByOrder.values()]
+      .flatMap((p) => p.versions)
+      .flatMap((v) => [v.image_path, v.video_path || ""]),
   );
 
   await Promise.all(
-    orders.map(async (o) => {
-      const row = indexById.get(o.shopifyOrderId);
-      if (row) {
-        indexById.set(o.shopifyOrderId, await reconcileSupplierOrder(row, o.businessStatus));
-      }
+    indexRows.map((row) => {
+      const status = statusById.get(row.shopify_order_id);
+      return status ? reconcileSupplierOrder(row, status) : null;
     }),
   );
 
   const result = new Map<string, PortraitHistory>();
   for (const o of orders) {
-    const versions = versionsByOrder.get(o.shopifyOrderId) || [];
-    const requests = requestsByOrder.get(o.shopifyOrderId) || [];
-    const index = indexById.get(o.shopifyOrderId);
+    const progress = progressByOrder.get(o.shopifyOrderId)!;
     result.set(o.shopifyOrderId, {
       businessStatus: o.businessStatus,
-      versionCount: index?.version_count ?? versions.length,
-      modificationCount: index?.modification_count ?? requests.length,
-      versions: versions.map((v) => ({
+      versionCount: progress.versionCount,
+      modificationCount: progress.modificationCount,
+      versions: progress.versions.map((v) => ({
         versionNumber: v.version_number,
         imageUrl: urls.get(v.image_path) || null,
         videoUrl: v.video_path ? urls.get(v.video_path) || null : null,
         createdAt: v.created_at,
       })),
-      modificationRequests: requests.map((r) => ({
+      modificationRequests: progress.requests.map((r) => ({
         againstVersion: r.against_version,
         createdAt: r.created_at,
         notes: r.notes.map((n) => ({

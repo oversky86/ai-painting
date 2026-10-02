@@ -12,7 +12,6 @@ import {
 } from "./supplier-store.server";
 
 type AdminClient = Parameters<typeof setOrderBusinessStatus>[0];
-type StatusExtra = Parameters<typeof claimStatus>[0]["extra"];
 
 /** Thrown from `apply` to abort the transition with a specific HTTP status. */
 export class TransitionAbort extends Error {
@@ -45,7 +44,6 @@ export async function runTransition<T = undefined>(input: {
   index: SupplierOrderRow;
   current: BusinessStatus;
   next: BusinessStatus;
-  extra?: StatusExtra;
   apply?: () => Promise<T>;
   undo?: (result: T) => Promise<void>;
   /** The side effect cannot be undone (Shopify fulfillment): keep the claim if the metafield write fails. */
@@ -61,7 +59,7 @@ export async function runTransition<T = undefined>(input: {
     return { ok: false, status: 409, error: BUSY_MESSAGE };
   }
 
-  const claimed = await claimStatus({ row: index, from: current, to: next, extra: input.extra });
+  const claimed = await claimStatus({ row: index, from: current, to: next });
   if (!claimed) {
     return { ok: false, status: 409, error: BUSY_MESSAGE };
   }
@@ -92,7 +90,7 @@ export async function runTransition<T = undefined>(input: {
         ok: false,
         status: 502,
         error:
-          "Shopify accepted the change, but the order status could not be saved. Wait a minute, then submit again to finish.",
+          "Shopify accepted the change, but the order status could not be saved. Refresh the order; it will catch up on its own.",
       };
     }
     if (input.undo) {
