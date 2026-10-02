@@ -1,0 +1,16 @@
+{
+  "customizationTitle": "Your Customization",
+  "styleLabel": "Style",
+  "keywordsLabel": "Keywords",
+  "originalPhoto": "Original photo",
+  "generatedPainting": "Generated painting",
+  "originalPhotoFull": "Original Photo",
+  "generatedPaintingFull": "Generated Painting",
+  "progressHeading": "Where your artwork is",
+  "progressBody": "After checkout, your portrait moves through preview review, hand painting, finishing, and protected shipping. Use Review portrait when a preview is ready for your approval.",
+  "reviewPortrait": "Review portrait",
+  "paymentHeading": "Payment status",
+  "paymentBody": "Your order total includes the AI preview, hand painting, and protected shipping. Contact support if a charge looks unexpected.",
+  "fulfillmentHeading": "Fulfillment & delivery",
+  "fulfillmentBody": "Handmade portraits ship after you approve the final direction. Tracking appears here once the studio hands the piece to the carrier."
+}

@@ -11,7 +11,7 @@ const MAX_SIZE = 10 * 1024 * 1024; // 10MB
 export function loader({ request }: LoaderFunctionArgs) {
   const preflight = handleCorsPreflight(request);
   if (preflight) return preflight;
-  return withCors(Response.json({ error: "Method not allowed" }, { status: 405 }));
+  return withCors(Response.json({ error: "Method not allowed" }, { status: 405 }), request);
 }
 
 export async function action({ request }: ActionFunctionArgs) {
@@ -21,12 +21,12 @@ export async function action({ request }: ActionFunctionArgs) {
 
   // Only allow POST
   if (request.method !== "POST") {
-    return withCors(Response.json({ error: "Method not allowed" }, { status: 405 }));
+    return withCors(Response.json({ error: "Method not allowed" }, { status: 405 }), request);
   }
 
   // App Proxy HMAC verification
   if (!verifyAppProxySignature(request)) {
-    return withCors(Response.json({ error: "Unauthorized" }, { status: 401 }));
+    return withCors(Response.json({ error: "Unauthorized" }, { status: 401 }), request);
   }
 
   try {
@@ -35,7 +35,7 @@ export async function action({ request }: ActionFunctionArgs) {
     const file = formData.get("photo") as File | null;
 
     if (!file) {
-      return withCors(Response.json({ error: "No photo provided" }, { status: 400 }));
+      return withCors(Response.json({ error: "No photo provided" }, { status: 400 }), request);
     }
 
     console.log("[upload] File received:", file.name, file.type, `${(file.size / 1024).toFixed(1)}KB`);
@@ -43,13 +43,14 @@ export async function action({ request }: ActionFunctionArgs) {
     // Validate file type
     if (!ACCEPTED_TYPES.includes(file.type)) {
       return withCors(
-        Response.json({ error: "Invalid file type. Accepted: JPG, PNG, WebP" }, { status: 400 })
+        Response.json({ error: "Invalid file type. Accepted: JPG, PNG, WebP" }, { status: 400 }),
+        request
       );
     }
 
     // Validate file size
     if (file.size > MAX_SIZE) {
-      return withCors(Response.json({ error: "File too large. Maximum size is 10MB" }, { status: 400 }));
+      return withCors(Response.json({ error: "File too large. Maximum size is 10MB" }, { status: 400 }), request);
     }
 
     const buffer = Buffer.from(await file.arrayBuffer());
@@ -60,11 +61,12 @@ export async function action({ request }: ActionFunctionArgs) {
     const photoUrl = await uploadOriginalPhoto(buffer, shop, jobId);
     console.log("[upload] Success:", photoUrl);
 
-    return withCors(Response.json({ photo_url: photoUrl, job_id: jobId }));
+    return withCors(Response.json({ photo_url: photoUrl, job_id: jobId }), request);
   } catch (error: any) {
     console.error("[upload] Error:", error?.message || error, error?.stack || "");
     return withCors(
-      Response.json({ error: "Upload failed. Please try again.", detail: error?.message || "unknown" }, { status: 503 })
+      Response.json({ error: "Upload failed. Please try again.", detail: error?.message || "unknown" }, { status: 503 }),
+      request
     );
   }
 }

@@ -10,7 +10,7 @@ import { checkDailyLimit } from "../utils/rate-limit";
 export function loader({ request }: LoaderFunctionArgs) {
   const preflight = handleCorsPreflight(request);
   if (preflight) return preflight;
-  return withCors(Response.json({ error: "Method not allowed" }, { status: 405 }));
+  return withCors(Response.json({ error: "Method not allowed" }, { status: 405 }), request);
 }
 
 export async function action({ request }: ActionFunctionArgs) {
@@ -20,12 +20,12 @@ export async function action({ request }: ActionFunctionArgs) {
 
   // Only allow POST
   if (request.method !== "POST") {
-    return withCors(Response.json({ error: "Method not allowed" }, { status: 405 }));
+    return withCors(Response.json({ error: "Method not allowed" }, { status: 405 }), request);
   }
 
   // App Proxy HMAC verification
   if (!verifyAppProxySignature(request)) {
-    return withCors(Response.json({ error: "Unauthorized" }, { status: 401 }));
+    return withCors(Response.json({ error: "Unauthorized" }, { status: 401 }), request);
   }
 
   // Daily rate limit check
@@ -34,7 +34,7 @@ export async function action({ request }: ActionFunctionArgs) {
     return withCors(Response.json(
       { error: `Daily limit reached. You can generate ${rateLimit.limit} images per day. Try again tomorrow.` },
       { status: 429, headers: { "X-RateLimit-Remaining": "0", "X-RateLimit-Limit": String(rateLimit.limit) } }
-    ));
+    ), request);
   }
 
   try {
@@ -44,7 +44,7 @@ export async function action({ request }: ActionFunctionArgs) {
       return withCors(Response.json(
         { error: "photo_url and style are required" },
         { status: 400 }
-      ));
+      ), request);
     }
 
     const shop = getShopFromProxy(request);
@@ -71,7 +71,7 @@ export async function action({ request }: ActionFunctionArgs) {
         job_id: jobId,
         status: "accepted",
         remaining: rateLimit.remaining,
-      }));
+      }), request);
     }
 
     // Mock mode: immediately complete with uploaded photo as result
@@ -90,12 +90,12 @@ export async function action({ request }: ActionFunctionArgs) {
       job_id: jobId,
       status: "accepted",
       remaining: rateLimit.remaining,
-    }));
+    }), request);
   } catch (error) {
     console.error("Generate preview error:", error);
     return withCors(Response.json(
       { error: "AI service temporarily unavailable. Please try again." },
       { status: 503 }
-    ));
+    ), request);
   }
 }

@@ -1,9 +1,18 @@
 node_modules/
 build/
-.vercel/
+dist/
 .react-router/
 .shopify/
+.vercel/
+.cursor/
+.gemini/
+
+# secrets — never commit; .env.example is the only template that may be committed
 .env
+.env.*
+!.env.example
+
 .DS_Store
 *.log
 *.sqlite
+*.tsbuildinfo

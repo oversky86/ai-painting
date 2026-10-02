@@ -1,0 +1,16 @@
+{
+  "customizationTitle": "Votre personnalisation",
+  "styleLabel": "Style",
+  "keywordsLabel": "Mots-clés",
+  "originalPhoto": "Photo originale",
+  "generatedPainting": "Peinture générée",
+  "originalPhotoFull": "Photo originale",
+  "generatedPaintingFull": "Peinture générée",
+  "progressHeading": "Où en est votre œuvre",
+  "progressBody": "Après le paiement, votre portrait passe par la validation de l'aperçu, la peinture à la main, la finition et l'expédition protégée. Utilisez Examiner le portrait lorsqu'un aperçu est prêt.",
+  "reviewPortrait": "Examiner le portrait",
+  "paymentHeading": "Statut du paiement",
+  "paymentBody": "Le total de votre commande inclut l'aperçu IA, la peinture à la main et l'expédition protégée. Contactez le support si un montant vous paraît inattendu.",
+  "fulfillmentHeading": "Expédition et livraison",
+  "fulfillmentBody": "Les portraits peints à la main sont expédiés après votre validation. Le suivi apparaît ici une fois l'œuvre remise au transporteur."
+}

@@ -1,0 +1,25 @@
+api_version = "2026-04"
+
+[[extensions]]
+name = "Piktura Checkout Customization"
+handle = "piktura-checkout"
+uid = "7432a943-ee9d-4974-0306-c55a7c23e2b19d737692"
+type = "ui_extension"
+
+  # Checkout 订单摘要 — 每行商品下方
+  [[extensions.targeting]]
+  module = "./src/CheckoutLineItem.jsx"
+  target = "purchase.checkout.cart-line-item.render-after"
+
+  # Thank You 页行项下方
+  [[extensions.targeting]]
+  module = "./src/ThankYouLine.jsx"
+  target = "purchase.thank-you.cart-line-item.render-after"
+
+  # Thank You 页 block target
+  [[extensions.targeting]]
+  module = "./src/ThankYouBlock.jsx"
+  target = "purchase.thank-you.block.render"
+
+[extensions.capabilities]
+api_access = true

@@ -1,0 +1,20 @@
+api_version = "2026-04"
+
+[[extensions]]
+name = "Piktura Customization Display"
+handle = "piktura-customization"
+type = "ui_extension"
+uid = "6e213b22-d704-7322-3cbb-7ada725920e60712e2af"
+
+  # Thank You 页行项下方
+  [[extensions.targeting]]
+  module = "./src/ThankYouLine.jsx"
+  target = "purchase.thank-you.cart-line-item.render-after"
+
+  # Thank You 页 block target
+  [[extensions.targeting]]
+  module = "./src/ThankYouBlock.jsx"
+  target = "purchase.thank-you.block.render"
+
+[extensions.capabilities]
+api_access = true

@@ -1,0 +1,29 @@
+# The version of APIs your extension will receive. Learn more:
+# https://shopify.dev/docs/api/usage/versioning
+api_version = "2026-04"
+
+[[extensions]]
+name = "Piktura Order Status Customization"
+handle = "piktura-order-status"
+type = "ui_extension"
+uid = "d383d098-a2b6-372b-dad4-673cc660c7d04a607533"
+
+# Order status page — renders after each cart line item
+[[extensions.targeting]]
+module = "./src/OrderStatusLine.jsx"
+target = "customer-account.order-status.cart-line-item.render-after"
+
+[[extensions.targeting]]
+module = "./src/OrderStatusBlock.jsx"
+target = "customer-account.order-status.block.render"
+
+[[extensions.targeting]]
+module = "./src/PaymentDetails.jsx"
+target = "customer-account.order-status.payment-details.render-after"
+
+[[extensions.targeting]]
+module = "./src/FulfillmentDetails.jsx"
+target = "customer-account.order-status.fulfillment-details.render-after"
+
+[extensions.capabilities]
+api_access = true

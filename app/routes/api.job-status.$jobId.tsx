@@ -12,17 +12,17 @@ export async function loader({ params, request }: LoaderFunctionArgs) {
 
   // Only allow GET
   if (request.method !== "GET") {
-    return withCors(Response.json({ error: "Method not allowed" }, { status: 405 }));
+    return withCors(Response.json({ error: "Method not allowed" }, { status: 405 }), request);
   }
 
   // App Proxy HMAC verification
   if (!verifyAppProxySignature(request)) {
-    return withCors(Response.json({ error: "Unauthorized" }, { status: 401 }));
+    return withCors(Response.json({ error: "Unauthorized" }, { status: 401 }), request);
   }
 
   const jobId = params.jobId;
   if (!jobId) {
-    return withCors(Response.json({ status: "not_found" }, { status: 404 }));
+    return withCors(Response.json({ status: "not_found" }, { status: 404 }), request);
   }
 
   try {
@@ -30,22 +30,22 @@ export async function loader({ params, request }: LoaderFunctionArgs) {
     const job = await getJob(jobId);
 
     if (!job) {
-      return withCors(Response.json({ status: "not_found" }, { status: 404 }));
+      return withCors(Response.json({ status: "not_found" }, { status: 404 }), request);
     }
 
     // If already completed, return cached result
     if (job.status === "completed") {
-      return withCors(Response.json({ status: "completed", result_url: job.resultUrl }));
+      return withCors(Response.json({ status: "completed", result_url: job.resultUrl }), request);
     }
 
     // If already failed, return error
     if (job.status === "failed") {
-      return withCors(Response.json({ status: "failed", error: "Generation failed" }));
+      return withCors(Response.json({ status: "failed", error: "Generation failed" }), request);
     }
 
     // Poll Replicate for prediction status
     if (!job.replicateId) {
-      return withCors(Response.json({ status: "processing" }));
+      return withCors(Response.json({ status: "processing" }), request);
     }
 
     const prediction = await getPrediction(job.replicateId);
@@ -56,7 +56,7 @@ export async function loader({ params, request }: LoaderFunctionArgs) {
       return withCors(Response.json({
         status: "failed",
         error: prediction.error || "Generation failed",
-      }));
+      }), request);
     }
 
     // Handle successful prediction: download → upload to Supabase
@@ -69,7 +69,7 @@ export async function loader({ params, request }: LoaderFunctionArgs) {
             : "";
 
       if (!outputUrl) {
-        return withCors(Response.json({ status: "processing" }));
+        return withCors(Response.json({ status: "processing" }), request);
       }
 
       // Image transfer: Replicate output → memory download → Supabase Storage upload
@@ -79,13 +79,13 @@ export async function loader({ params, request }: LoaderFunctionArgs) {
       // Update job with result
       await updateJob(jobId, { status: "completed", resultUrl: paintingUrl });
 
-      return withCors(Response.json({ status: "completed", result_url: paintingUrl }));
+      return withCors(Response.json({ status: "completed", result_url: paintingUrl }), request);
     }
 
     // Still processing
-    return withCors(Response.json({ status: "processing" }));
+    return withCors(Response.json({ status: "processing" }), request);
   } catch (error) {
     console.error("Job status check error:", error);
-    return withCors(Response.json({ status: "processing" }));
+    return withCors(Response.json({ status: "processing" }), request);
   }
 }
