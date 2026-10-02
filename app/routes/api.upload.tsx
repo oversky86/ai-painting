@@ -3,9 +3,14 @@ import { nanoid } from "nanoid";
 import { uploadOriginalPhoto } from "../utils/supabase.server";
 import { withCors, handleCorsPreflight } from "../utils/cors.server";
 import { verifyAppProxySignature, getShopFromProxy } from "../utils/app-proxy-verify";
+import {
+  CustomerPhotoError,
+  customerPhotoContentType,
+  toStoredCustomerPhoto,
+} from "../utils/customer-photo.server";
 
-const ACCEPTED_TYPES = ["image/jpeg", "image/png", "image/webp"];
 const MAX_SIZE = 10 * 1024 * 1024; // 10MB
+const TYPE_ERROR = "Invalid file type. Accepted: JPG, PNG, WebP, GIF, HEIC, HEIF, AVIF, BMP, TIFF";
 
 // Handle CORS preflight (OPTIONS)
 export function loader({ request }: LoaderFunctionArgs) {
@@ -40,12 +45,9 @@ export async function action({ request }: ActionFunctionArgs) {
 
     console.log("[upload] File received:", file.name, file.type, `${(file.size / 1024).toFixed(1)}KB`);
 
-    // Validate file type
-    if (!ACCEPTED_TYPES.includes(file.type)) {
-      return withCors(
-        Response.json({ error: "Invalid file type. Accepted: JPG, PNG, WebP" }, { status: 400 }),
-        request
-      );
+    const contentType = customerPhotoContentType(file);
+    if (!contentType) {
+      return withCors(Response.json({ error: TYPE_ERROR }, { status: 400 }), request);
     }
 
     // Validate file size
@@ -53,7 +55,15 @@ export async function action({ request }: ActionFunctionArgs) {
       return withCors(Response.json({ error: "File too large. Maximum size is 10MB" }, { status: 400 }), request);
     }
 
-    const buffer = Buffer.from(await file.arrayBuffer());
+    let buffer: Buffer = Buffer.from(await file.arrayBuffer());
+    try {
+      buffer = await toStoredCustomerPhoto(buffer, contentType);
+    } catch (error) {
+      if (error instanceof CustomerPhotoError) {
+        return withCors(Response.json({ error: error.message }, { status: 400 }), request);
+      }
+      throw error;
+    }
     const shop = getShopFromProxy(request);
     const jobId = nanoid();
 
