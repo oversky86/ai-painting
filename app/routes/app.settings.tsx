@@ -1,5 +1,7 @@
+import { useEffect, useRef } from "react";
 import type { ActionFunctionArgs, HeadersFunction, LoaderFunctionArgs } from "react-router";
 import { useFetcher, useLoaderData } from "react-router";
+import { useAppBridge } from "@shopify/app-bridge-react";
 import { authenticate } from "../shopify.server";
 import { boundary } from "@shopify/shopify-app-react-router/server";
 import prisma from "../db.server";
@@ -59,17 +61,56 @@ export const action = async ({ request }: ActionFunctionArgs) => {
   }
 };
 
+const SAVE_CONFIRM_MODAL_ID = "save-settings-modal";
+
 export default function Settings() {
   const data = useLoaderData<typeof loader>();
   const fetcher = useFetcher<typeof action>();
+  const shopify = useAppBridge();
+  const formRef = useRef<HTMLFormElement>(null);
+  const confirmedSaveRef = useRef(false);
+  const saveLockedRef = useRef(false);
 
   const isSaving = fetcher.state === "submitting";
+
+  useEffect(() => {
+    if (fetcher.state === "idle") saveLockedRef.current = false;
+  }, [fetcher.state]);
+
   const saved = fetcher.data?.success;
   const stylePrompts = fetcher.data?.stylePrompts || data.stylePrompts;
 
+  const openSaveConfirm = () => {
+    if (isSaving || saveLockedRef.current) return;
+    shopify.modal.show(SAVE_CONFIRM_MODAL_ID);
+  };
+
+  const confirmSave = () => {
+    if (isSaving || saveLockedRef.current) return;
+    const form = formRef.current;
+    if (!form) return;
+    saveLockedRef.current = true;
+    confirmedSaveRef.current = true;
+    shopify.modal.hide(SAVE_CONFIRM_MODAL_ID);
+    form.requestSubmit();
+    if (confirmedSaveRef.current) {
+      confirmedSaveRef.current = false;
+      saveLockedRef.current = false;
+    }
+  };
+
+  const onSubmit = (event: React.FormEvent<HTMLFormElement>) => {
+    if (confirmedSaveRef.current) {
+      confirmedSaveRef.current = false;
+      return;
+    }
+    event.preventDefault();
+    openSaveConfirm();
+  };
+
   return (
     <s-page heading="Generation settings">
-      <fetcher.Form method="post">
+      <fetcher.Form method="post" ref={formRef} onSubmit={onSubmit}>
         <s-section heading="Daily Image Generation Limits">
           <s-paragraph>
             Configure how many images each buyer can generate per day.
@@ -113,7 +154,11 @@ export default function Settings() {
               />
             ))}
           </s-stack>
-          <s-button type="submit" {...(isSaving ? { loading: true } : {})}>
+          <s-button
+            type="button"
+            onClick={openSaveConfirm}
+            {...(isSaving ? { loading: true } : {})}
+          >
             Save settings
           </s-button>
           {saved && (
@@ -128,6 +173,26 @@ export default function Settings() {
           )}
         </s-section>
       </fetcher.Form>
+
+      <s-modal id={SAVE_CONFIRM_MODAL_ID} heading="Save changes?" size="small-100">
+        <s-paragraph>This will update the store configuration.</s-paragraph>
+        <s-button
+          slot="primary-action"
+          variant="primary"
+          onClick={confirmSave}
+          {...(isSaving ? { loading: true } : {})}
+        >
+          Save
+        </s-button>
+        <s-button
+          slot="secondary-actions"
+          variant="secondary"
+          commandFor={SAVE_CONFIRM_MODAL_ID}
+          command="--hide"
+        >
+          Cancel
+        </s-button>
+      </s-modal>
 
       <s-section slot="aside" heading="How it works">
         <s-paragraph>
