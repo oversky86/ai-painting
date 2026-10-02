@@ -2,13 +2,16 @@ import Replicate from "replicate";
 
 const replicate = new Replicate({ auth: process.env.REPLICATE_API_TOKEN! });
 
+/** Official Replicate model for Nano Banana 2. A pinned version hash was an older model. */
+const IMAGE_MODEL = "google/nano-banana-2";
+
 /**
- * Create a Replicate prediction (async, does not wait for result)
- * Uses google/nano-banana model for pet portrait generation
+ * Create a Replicate prediction (async, does not wait for result).
+ * Nano Banana 2 edits the uploaded photo from a natural-language prompt.
  */
 export async function createPrediction(photoUrl: string, prompt: string) {
   const prediction = await replicate.predictions.create({
-    version: process.env.REPLICATE_MODEL_VERSION!,
+    model: IMAGE_MODEL,
     input: {
       prompt,
       image_input: [photoUrl],

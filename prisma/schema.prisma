@@ -70,6 +70,17 @@ model OrderRecord {
   createdAt       DateTime @default(now())
 }
 
+// Merchant-configurable system prompt for one painting style (one row per shop + style)
+model ShopStylePrompt {
+  id        Int      @id @default(autoincrement())
+  shop      String
+  styleKey  String
+  prompt    String
+  updatedAt DateTime @updatedAt
+
+  @@unique([shop, styleKey])
+}
+
 // Merchant-configurable rate limit settings (one per shop)
 model ShopRateLimit {
   id                    Int      @id @default(autoincrement())

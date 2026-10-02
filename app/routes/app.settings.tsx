@@ -3,6 +3,11 @@ import { useFetcher, useLoaderData } from "react-router";
 import { authenticate } from "../shopify.server";
 import { boundary } from "@shopify/shopify-app-react-router/server";
 import prisma from "../db.server";
+import { STYLE_KEYS, STYLE_LABELS, type StyleKey } from "../utils/prompts.server";
+import {
+  effectiveStylePrompts,
+  saveStylePromptOverrides,
+} from "../utils/style-prompts.server";
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
   const { session } = await authenticate.admin(request);
@@ -13,9 +18,14 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     return {
       dailyLimitLoggedIn: settings?.dailyLimitLoggedIn ?? 5,
       dailyLimitAnonymous: settings?.dailyLimitAnonymous ?? 3,
+      stylePrompts: await effectiveStylePrompts(shop),
     };
   } catch {
-    return { dailyLimitLoggedIn: 5, dailyLimitAnonymous: 3 };
+    return {
+      dailyLimitLoggedIn: 5,
+      dailyLimitAnonymous: 3,
+      stylePrompts: await effectiveStylePrompts(shop),
+    };
   }
 };
 
@@ -26,6 +36,9 @@ export const action = async ({ request }: ActionFunctionArgs) => {
 
   const dailyLimitLoggedIn = parseInt(formData.get("dailyLimitLoggedIn") as string) || 5;
   const dailyLimitAnonymous = parseInt(formData.get("dailyLimitAnonymous") as string) || 3;
+  const stylePrompts = Object.fromEntries(
+    STYLE_KEYS.map((key) => [key, String(formData.get(`prompt_${key}`) || "")]),
+  ) as Record<StyleKey, string>;
 
   try {
     await prisma.shopRateLimit.upsert({
@@ -33,7 +46,13 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       update: { dailyLimitLoggedIn, dailyLimitAnonymous },
       create: { shop, dailyLimitLoggedIn, dailyLimitAnonymous },
     });
-    return { success: true, dailyLimitLoggedIn, dailyLimitAnonymous };
+    const savedPrompts = await saveStylePromptOverrides(shop, stylePrompts);
+    return {
+      success: true,
+      dailyLimitLoggedIn,
+      dailyLimitAnonymous,
+      stylePrompts: savedPrompts,
+    };
   } catch (error) {
     console.error("[settings] Save failed:", error);
     return { success: false, error: "Failed to save settings" };
@@ -46,9 +65,10 @@ export default function Settings() {
 
   const isSaving = fetcher.state === "submitting";
   const saved = fetcher.data?.success;
+  const stylePrompts = fetcher.data?.stylePrompts || data.stylePrompts;
 
   return (
-    <s-page heading="Generation Limits">
+    <s-page heading="Generation settings">
       <fetcher.Form method="post">
         <s-section heading="Daily Image Generation Limits">
           <s-paragraph>
@@ -60,31 +80,49 @@ export default function Settings() {
             <s-text-field
               name="dailyLimitLoggedIn"
               label="Logged-in customer daily limit"
-              type="number"
               value={String(fetcher.data?.dailyLimitLoggedIn ?? data.dailyLimitLoggedIn)}
-              helpText="Maximum images per day for logged-in customers"
+              details="Maximum images per day for logged-in customers"
             />
 
             <s-text-field
               name="dailyLimitAnonymous"
               label="Anonymous visitor daily limit"
-              type="number"
               value={String(fetcher.data?.dailyLimitAnonymous ?? data.dailyLimitAnonymous)}
-              helpText="Maximum images per day for anonymous visitors (tracked by IP)"
+              details="Maximum images per day for anonymous visitors (tracked by IP)"
             />
           </s-stack>
+        </s-section>
 
+        <s-section heading="Style system prompts">
+          <s-paragraph>
+            Each style has a system prompt. Words the buyer enters are placed first,
+            then this prompt. If the buyer leaves the field empty, only the system
+            prompt is sent. Clear a box and save to restore its default.
+          </s-paragraph>
+          <s-stack direction="block" gap="base">
+            {STYLE_KEYS.map((key) => (
+              <s-text-area
+                key={`${key}-${saved ? "saved" : "edit"}`}
+                name={`prompt_${key}`}
+                label={STYLE_LABELS[key]}
+                defaultValue={stylePrompts[key]}
+                rows={6}
+                maxLength={8000}
+                minLength={0}
+                details="Leave blank and save to use the default prompt."
+              />
+            ))}
+          </s-stack>
           <s-button type="submit" {...(isSaving ? { loading: true } : {})}>
             Save settings
           </s-button>
-
           {saved && (
-            <s-banner tone="success" title="Settings saved">
-              Rate limits updated successfully.
+            <s-banner tone="success">
+              Settings saved.
             </s-banner>
           )}
           {fetcher.data?.error && (
-            <s-banner tone="critical" title="Error">
+            <s-banner tone="critical">
               {fetcher.data.error}
             </s-banner>
           )}

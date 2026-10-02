@@ -1,7 +1,8 @@
 import type { ActionFunctionArgs, LoaderFunctionArgs } from "react-router";
 import { nanoid } from "nanoid";
 import { createJob } from "../utils/job-store.server";
-import { buildPrompt } from "../utils/prompts.server";
+import { buildGenerationPrompt } from "../utils/prompts.server";
+import { loadStylePromptOverrides } from "../utils/style-prompts.server";
 import { withCors, handleCorsPreflight } from "../utils/cors.server";
 import { verifyAppProxySignature, getShopFromProxy } from "../utils/app-proxy-verify";
 import { checkDailyLimit } from "../utils/rate-limit";
@@ -38,7 +39,7 @@ export async function action({ request }: ActionFunctionArgs) {
   }
 
   try {
-    const { photo_url, style, generate } = await request.json();
+    const { photo_url, style, keywords, generate } = await request.json();
 
     if (!photo_url || !style) {
       return withCors(Response.json(
@@ -49,7 +50,12 @@ export async function action({ request }: ActionFunctionArgs) {
 
     const shop = getShopFromProxy(request);
     const jobId = nanoid();
-    const prompt = buildPrompt(style);
+    const userPrompt = typeof keywords === "string" ? keywords : "";
+    const prompt = buildGenerationPrompt(
+      style,
+      userPrompt,
+      await loadStylePromptOverrides(shop),
+    );
 
     // Real Replicate mode: create prediction + async polling via job-status
     if (generate) {
