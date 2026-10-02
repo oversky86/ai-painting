@@ -6,7 +6,6 @@ import {
   orderNumericId,
   resolveAllowedShop,
 } from "../utils/hmac-auth.server";
-import { MAX_PORTRAIT_VERSIONS } from "../utils/business-status.server";
 import {
   createOrderFulfillment,
   effectiveBusinessStatus,
@@ -275,9 +274,6 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     }
 
     const { nextVersion } = await loadOrderPortraitProgress(shop, shopifyOrderId, current);
-    if (nextVersion > MAX_PORTRAIT_VERSIONS) {
-      return json({ ok: false, error: "Maximum portrait versions reached" }, 409);
-    }
 
     const signed = await createUploadSignedUrl({
       shop,
@@ -310,9 +306,6 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     const current = gate.businessStatus;
     const progress = await loadOrderPortraitProgress(shop, shopifyOrderId, current);
     const nextVersion = progress.nextVersion;
-    if (nextVersion > MAX_PORTRAIT_VERSIONS) {
-      return json({ ok: false, error: "Maximum portrait versions reached" }, 409);
-    }
 
     const slot = { shop, shopifyOrderId, versionNumber: nextVersion };
     const [imageOk, videoOk] = await Promise.all([

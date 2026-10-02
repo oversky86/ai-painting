@@ -7,7 +7,6 @@ import {
   orderNumericId,
   resolveAllowedShop,
 } from "../utils/hmac-auth.server";
-import { canRequestModification } from "../utils/business-status.server";
 import {
   effectiveBusinessStatus,
   fetchOrderGates,
@@ -275,17 +274,6 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       });
       if (!outcome.ok) return json({ ok: false, error: outcome.error }, outcome.status);
       return json({ ok: true, businessStatus: "prepare_shipment", orderId: ownerId });
-    }
-
-    if (current === "portrait_review" && !canRequestModification(versionCount)) {
-      return json(
-        {
-          ok: false,
-          error:
-            "Modification limit reached. Please approve the latest portrait.",
-        },
-        409,
-      );
     }
 
     const notes = parseNotes(body);

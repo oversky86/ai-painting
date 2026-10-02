@@ -8,8 +8,6 @@ export const BUSINESS_STATUSES = [
 
 export type BusinessStatus = (typeof BUSINESS_STATUSES)[number];
 
-export const MAX_PORTRAIT_VERSIONS = 3;
-
 const ALLOWED_TRANSITIONS: Record<BusinessStatus, BusinessStatus[]> = {
   order_placed: ["portrait_review"],
   portrait_review: ["prepare_shipment", "supplier_modification"],
@@ -48,7 +46,7 @@ export function assertTransition(
   }
 }
 
-/** Customer may request modifications only against versions 1 and 2. */
+/** A modification needs an uploaded portrait. There is no version cap. */
 export function canRequestModification(versionCount: number): boolean {
-  return versionCount > 0 && versionCount < MAX_PORTRAIT_VERSIONS;
+  return versionCount > 0;
 }
