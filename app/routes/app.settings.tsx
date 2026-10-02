@@ -3,7 +3,7 @@ import { useFetcher, useLoaderData } from "react-router";
 import { authenticate } from "../shopify.server";
 import { boundary } from "@shopify/shopify-app-react-router/server";
 import prisma from "../db.server";
-import { STYLE_KEYS, STYLE_LABELS, type StyleKey } from "../utils/prompts.server";
+import { STYLE_KEYS, STYLE_LABELS, type StyleKey } from "../utils/style-keys";
 import {
   effectiveStylePrompts,
   saveStylePromptOverrides,

@@ -1,18 +1,6 @@
-export const STYLE_KEYS = [
-  "realism",
-  "classic",
-  "impressionist",
-  "bold-expressive",
-] as const;
+import { STYLE_KEYS, type StyleKey } from "./style-keys";
 
-export type StyleKey = (typeof STYLE_KEYS)[number];
-
-export const STYLE_LABELS: Record<StyleKey, string> = {
-  realism: "Realism",
-  classic: "Classic",
-  impressionist: "Impressionist",
-  "bold-expressive": "Bold & Expressive",
-};
+export { STYLE_KEYS, STYLE_LABELS, type StyleKey } from "./style-keys";
 
 /** Used when the shop has not saved a custom system prompt for that style. */
 export const DEFAULT_STYLE_PROMPTS: Record<StyleKey, string> = {
