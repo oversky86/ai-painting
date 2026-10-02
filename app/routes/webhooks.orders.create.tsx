@@ -1,7 +1,11 @@
 import type { ActionFunctionArgs } from "react-router";
 import { authenticate } from "../shopify.server";
 import { upsertSupplierOrder } from "../utils/supplier-store.server";
-import { readOrderBusinessStatusValue } from "../utils/shopify-order.server";
+import {
+  ensureBusinessStatusRepeatable,
+  isUniqueMetafieldValueError,
+  readOrderBusinessStatusValue,
+} from "../utils/shopify-order.server";
 import {
   normalizeBusinessStatus,
   type BusinessStatus,
@@ -95,17 +99,31 @@ export const action = async ({ request }: ActionFunctionArgs) => {
         },
       ].filter(Boolean);
 
-      const response = await admin.graphql(
-        `mutation SetOrderMetafields($metafields: [MetafieldsSetInput!]!) {
-          metafieldsSet(metafields: $metafields) {
-            metafields { id key namespace }
-            userErrors { message field }
-          }
-        }`,
-        { variables: { metafields } },
-      );
-      const json = await response.json();
-      const errors = json.data?.metafieldsSet?.userErrors;
+      const writeMetafields = () =>
+        admin.graphql(
+          `mutation SetOrderMetafields($metafields: [MetafieldsSetInput!]!) {
+            metafieldsSet(metafields: $metafields) {
+              metafields { id key namespace }
+              userErrors { message field }
+            }
+          }`,
+          { variables: { metafields } },
+        );
+      let response = await writeMetafields();
+      let json = await response.json();
+      let errors = json.data?.metafieldsSet?.userErrors;
+      if (
+        errors?.some((error: { message?: string }) =>
+          isUniqueMetafieldValueError(error.message || ""),
+        )
+      ) {
+        const relaxed = await ensureBusinessStatusRepeatable(admin);
+        if (relaxed.ok) {
+          response = await writeMetafields();
+          json = await response.json();
+          errors = json.data?.metafieldsSet?.userErrors;
+        }
+      }
       if (errors?.length) {
         // A 5xx makes Shopify redeliver; the handler is safe to rerun (see existingStatus above).
         console.error(`[Webhook] metafieldsSet errors:`, errors);

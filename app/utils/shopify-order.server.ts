@@ -132,7 +132,149 @@ export async function readOrderBusinessStatusValue(
   return json?.data?.order?.businessStatus?.value || null;
 }
 
-export async function setOrderBusinessStatus(
+/** Shopify rejects a repeated status when the definition has unique values turned on. */
+export function isUniqueMetafieldValueError(message: string): boolean {
+  return /already assigned to another metafield/i.test(message);
+}
+
+function firstGraphqlMessage(json: {
+  errors?: Array<{ message?: string }>;
+}): string | null {
+  const message = json?.errors?.[0]?.message;
+  return message || null;
+}
+
+/**
+ * Order status is shared by many orders. If the definition was saved with unique
+ * values, turn that off. Shopify will not disable the capability in place, so
+ * the definition is recreated without it and existing values are kept.
+ */
+export async function ensureBusinessStatusRepeatable(
+  admin: AdminClient,
+): Promise<{ ok: boolean; message: string }> {
+  const found = await admin.graphql(
+    `#graphql
+    query FindBusinessStatusUnique {
+      metafieldDefinitions(
+        first: 1
+        ownerType: ORDER
+        namespace: "custom"
+        key: "business_status"
+      ) {
+        nodes {
+          id
+          capabilities { uniqueValues { enabled } }
+        }
+      }
+    }`,
+  );
+  const foundJson = await found.json();
+  const foundError = firstGraphqlMessage(foundJson);
+  if (foundError) return { ok: false, message: foundError };
+  const def = foundJson?.data?.metafieldDefinitions?.nodes?.[0];
+  if (!def?.id) return { ok: true, message: "no business_status definition" };
+  if (def.capabilities?.uniqueValues?.enabled !== true) {
+    return { ok: true, message: "business_status already allows repeated values" };
+  }
+
+  const disabled = await admin.graphql(
+    `#graphql
+    mutation DisableUniqueBusinessStatus($definition: MetafieldDefinitionUpdateInput!) {
+      metafieldDefinitionUpdate(definition: $definition) {
+        updatedDefinition { capabilities { uniqueValues { enabled } } }
+        userErrors { message }
+      }
+    }`,
+    {
+      variables: {
+        definition: {
+          namespace: "custom",
+          key: "business_status",
+          ownerType: "ORDER",
+          capabilities: { uniqueValues: { enabled: false } },
+        },
+      },
+    },
+  );
+  const disabledJson = await disabled.json();
+  const disabledTop = firstGraphqlMessage(disabledJson);
+  const updated = disabledJson?.data?.metafieldDefinitionUpdate?.updatedDefinition;
+  const disableErrors = disabledJson?.data?.metafieldDefinitionUpdate?.userErrors;
+  if (
+    !disabledTop &&
+    !disableErrors?.length &&
+    updated?.capabilities?.uniqueValues?.enabled === false
+  ) {
+    return { ok: true, message: "unique values disabled" };
+  }
+
+  const removed = await admin.graphql(
+    `#graphql
+    mutation DeleteUniqueBusinessStatus($id: ID!, $deleteAllAssociatedMetafields: Boolean!) {
+      metafieldDefinitionDelete(id: $id, deleteAllAssociatedMetafields: $deleteAllAssociatedMetafields) {
+        deletedDefinitionId
+        userErrors { message }
+      }
+    }`,
+    { variables: { id: def.id, deleteAllAssociatedMetafields: false } },
+  );
+  const removedJson = await removed.json();
+  const deleteTop = firstGraphqlMessage(removedJson);
+  const deleteErrors = removedJson?.data?.metafieldDefinitionDelete?.userErrors;
+  if (deleteTop || deleteErrors?.length) {
+    return {
+      ok: false,
+      message: deleteTop || deleteErrors[0].message || "Could not update business_status",
+    };
+  }
+
+  const created = await admin.graphql(
+    `#graphql
+    mutation RecreateBusinessStatus($definition: MetafieldDefinitionInput!) {
+      metafieldDefinitionCreate(definition: $definition) {
+        createdDefinition { id capabilities { uniqueValues { enabled } } }
+        userErrors { message code }
+      }
+    }`,
+    {
+      variables: {
+        definition: {
+          name: "business_status",
+          namespace: "custom",
+          key: "business_status",
+          description: "Order progress shared by every order",
+          type: "single_line_text_field",
+          ownerType: "ORDER",
+          pin: true,
+          access: {
+            admin: "PUBLIC_READ_WRITE",
+            storefront: "PUBLIC_READ",
+            customerAccount: "READ",
+          },
+        },
+      },
+    },
+  );
+  const createdJson = await created.json();
+  const createTop = firstGraphqlMessage(createdJson);
+  if (createTop) return { ok: false, message: createTop };
+  const createErrors = createdJson?.data?.metafieldDefinitionCreate?.userErrors;
+  if (createErrors?.length) {
+    const duplicate = createErrors.some(
+      (error: { code?: string }) => error.code === "TAKEN" || error.code === "DUPLICATE",
+    );
+    if (!duplicate) {
+      return { ok: false, message: createErrors[0].message || "Could not recreate business_status" };
+    }
+  }
+  const stillUnique =
+    createdJson?.data?.metafieldDefinitionCreate?.createdDefinition?.capabilities?.uniqueValues
+      ?.enabled === true;
+  if (stillUnique) return { ok: false, message: "business_status is still unique" };
+  return { ok: true, message: "business_status recreated without unique values" };
+}
+
+async function writeOrderBusinessStatus(
   admin: AdminClient,
   orderGid: string,
   status: BusinessStatus,
@@ -162,6 +304,22 @@ export async function setOrderBusinessStatus(
   const errors = json?.data?.metafieldsSet?.userErrors;
   if (errors?.length) {
     throw new Error(errors[0].message || "Failed to set business_status");
+  }
+}
+
+export async function setOrderBusinessStatus(
+  admin: AdminClient,
+  orderGid: string,
+  status: BusinessStatus,
+): Promise<void> {
+  try {
+    await writeOrderBusinessStatus(admin, orderGid, status);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : "";
+    if (!isUniqueMetafieldValueError(message)) throw err;
+    const relaxed = await ensureBusinessStatusRepeatable(admin);
+    if (!relaxed.ok) throw err;
+    await writeOrderBusinessStatus(admin, orderGid, status);
   }
 }
 
