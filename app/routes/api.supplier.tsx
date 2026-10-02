@@ -22,6 +22,7 @@ import {
 import {
   createUploadSignedUrl,
   deletePortraitVersion,
+  uploadExtensionForContentType,
   deleteStalePortraitRows,
   getSupplierOrder,
   insertPortraitVersion,
@@ -38,10 +39,28 @@ function json(data: unknown, status = 200) {
   return Response.json(data, { status });
 }
 
-const UPLOAD_CONTENT_TYPES = {
-  image: ["image/jpeg", "image/png", "image/webp"],
-  video: ["video/mp4", "video/webm", "video/quicktime"],
-} as const;
+function nonempty(value?: string | null): string | null {
+  const trimmed = value?.trim();
+  return trimmed || null;
+}
+
+/** Line-item properties (`_key` or `key`) when the matching order metafield was never written. */
+function lineProperty(
+  lineItems: Array<{
+    customAttributes?: Array<{ key?: string | null; value?: string | null }> | null;
+  }> | null | undefined,
+  key: string,
+): string | null {
+  for (const line of lineItems || []) {
+    for (const attr of line.customAttributes || []) {
+      const raw = attr?.key || "";
+      const normalized = raw.startsWith("_") ? raw.slice(1) : raw;
+      const value = nonempty(attr?.value);
+      if (value && normalized === key) return value;
+    }
+  }
+  return null;
+}
 
 async function parseSignedBody(request: Request) {
   const rawBody = await request.text();
@@ -183,6 +202,14 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     const urls = await signedReadUrls(
       progress.versions.flatMap((v) => [v.image_path, v.video_path || ""]),
     );
+    const lineItems = shopifyOrder.lineItems?.nodes || [];
+    const originalPhotoUrl =
+      nonempty(shopifyOrder.originalPhoto?.value) ||
+      lineProperty(lineItems, "original_photo_url");
+    const paintingUrl =
+      nonempty(shopifyOrder.paintingUrl?.value) ||
+      lineProperty(lineItems, "painting_url") ||
+      lineProperty(lineItems, "source_painting_url");
 
     return json({
       ok: true,
@@ -197,9 +224,9 @@ export const action = async ({ request }: ActionFunctionArgs) => {
         blockedReason: orderBlockReason(shopifyOrder),
         total: shopifyOrder.totalPriceSet?.shopMoney,
         shippingAddress: shopifyOrder.shippingAddress,
-        lineItems: shopifyOrder.lineItems?.nodes || [],
-        originalPhotoUrl: shopifyOrder.originalPhoto?.value || null,
-        paintingUrl: shopifyOrder.paintingUrl?.value || null,
+        lineItems,
+        originalPhotoUrl,
+        paintingUrl,
         paintingStyle: shopifyOrder.paintingStyle?.value || null,
         giftMessage: shopifyOrder.giftMessage?.value || null,
         businessStatus,
@@ -236,7 +263,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
   if (actionType === "create_upload_url") {
     const kind = body.kind === "video" ? "video" : "image";
     const contentType = String(body.contentType || "");
-    if (!(UPLOAD_CONTENT_TYPES[kind] as readonly string[]).includes(contentType)) {
+    if (!uploadExtensionForContentType(kind, contentType)) {
       return json({ ok: false, error: `Unsupported ${kind} type: ${contentType || "unknown"}` }, 400);
     }
 

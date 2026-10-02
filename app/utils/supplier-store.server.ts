@@ -286,9 +286,45 @@ export async function deleteStalePortraitRows(progress: PortraitProgress): Promi
 }
 
 const UPLOAD_FILE_PATTERN = {
-  image: /^image\.(jpg|png|webp)$/,
-  video: /^video\.(mp4|webm|mov)$/,
+  image: /^image\.(jpg|png|webp|gif|heic|heif)$/,
+  video: /^video\.(mp4|webm|mov|m4v|3gp)$/,
 } as const;
+
+/** Phone-photo and phone-video MIME types, including common aliases, mapped to a stored extension. */
+const UPLOAD_EXTENSION_BY_TYPE: Record<"image" | "video", Record<string, string>> = {
+  image: {
+    "image/jpeg": "jpg",
+    "image/jpg": "jpg",
+    "image/pjpeg": "jpg",
+    "image/png": "png",
+    "image/webp": "webp",
+    "image/gif": "gif",
+    "image/heic": "heic",
+    "image/heif": "heif",
+    "image/heic-sequence": "heic",
+    "image/heif-sequence": "heif",
+  },
+  video: {
+    "video/mp4": "mp4",
+    "video/mpeg": "mp4",
+    "video/quicktime": "mov",
+    "video/mov": "mov",
+    "video/x-m4v": "m4v",
+    "video/m4v": "m4v",
+    "video/webm": "webm",
+    "video/3gpp": "3gp",
+    "video/3gp": "3gp",
+    "video/3gpp2": "3gp",
+  },
+};
+
+export function uploadExtensionForContentType(
+  kind: "image" | "video",
+  contentType: string,
+): string | null {
+  const type = contentType.toLowerCase().split(";")[0].trim();
+  return UPLOAD_EXTENSION_BY_TYPE[kind][type] || null;
+}
 
 export function uploadFolder(
   shop: string,
@@ -322,18 +358,10 @@ export async function createUploadSignedUrl(input: {
   contentType: string;
 }): Promise<{ path: string; uploadUrl: string; token: string }> {
   const sb = getClient();
-  const ext =
-    input.kind === "image"
-      ? input.contentType.includes("png")
-        ? "png"
-        : input.contentType.includes("webp")
-          ? "webp"
-          : "jpg"
-      : input.contentType.includes("webm")
-        ? "webm"
-        : input.contentType.includes("quicktime")
-          ? "mov"
-          : "mp4";
+  const ext = uploadExtensionForContentType(input.kind, input.contentType);
+  if (!ext) {
+    throw new Error(`Unsupported ${input.kind} type: ${input.contentType || "unknown"}`);
+  }
   const path = `${uploadFolder(input.shop, input.shopifyOrderId, input.versionNumber)}/${input.kind}.${ext}`;
 
   // upsert lets the supplier retry an upload for a version that was never confirmed.
