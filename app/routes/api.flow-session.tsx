@@ -25,6 +25,7 @@ type SessionPayload = {
   phone?: string | null;
   visitor_key?: string | null;
   migrate_from?: string | null;
+  clear?: boolean | null;
 };
 
 function visitorKeyFromRequest(request: Request, body?: SessionPayload): string {
@@ -118,6 +119,23 @@ export async function action({ request }: ActionFunctionArgs) {
   const visitorKey = visitorKeyFromRequest(request, body);
   if (!visitorKey) {
     return withCors(Response.json({ error: "visitor_key required" }, { status: 400 }), request);
+  }
+
+  if (body.clear === true) {
+    const keys = [visitorKey];
+    const migrateFrom = String(body.migrate_from || "").trim();
+    if (migrateFrom) {
+      keys.push(migrateFrom.startsWith("guest:") ? migrateFrom : `guest:${migrateFrom}`);
+    }
+    try {
+      await prisma.flowSession.deleteMany({
+        where: { shop, visitorKey: { in: keys } },
+      });
+      return withCors(Response.json({ ok: true }), request);
+    } catch (error) {
+      console.error("[flow-session] clear failed:", error);
+      return withCors(Response.json({ error: "Failed to clear session" }, { status: 503 }), request);
+    }
   }
 
   const data = {
