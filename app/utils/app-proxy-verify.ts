@@ -7,14 +7,16 @@
  * multiple Shopify apps can share the same backend.
  */
 import crypto from "crypto";
+import { canonicalShop } from "./shops.server";
 
-/** All valid API secrets — supports multi-app setups via comma-separated SHOPIFY_API_SECRETS */
-const SECRETS: string[] = (
-  process.env.SHOPIFY_API_SECRETS || process.env.SHOPIFY_API_SECRET || ""
-)
-  .split(",")
+/** All valid API secrets — comma-separated SHOPIFY_API_SECRETS, plus each app secret. */
+const SECRETS: string[] = [
+  ...(process.env.SHOPIFY_API_SECRETS || "").split(","),
+  process.env.SHOPIFY_API_SECRET || "",
+  process.env.SHOPIFY_API_SECRET_LIVE || "",
+]
   .map((s) => s.trim())
-  .filter(Boolean);
+  .filter((s, index, all) => s && all.indexOf(s) === index);
 
 export function verifyAppProxySignature(request: Request): boolean {
   if (SECRETS.length === 0) {
@@ -79,7 +81,7 @@ export function verifyAppProxySignature(request: Request): boolean {
  */
 export function getShopFromProxy(request: Request): string {
   const url = new URL(request.url);
-  return url.searchParams.get("shop") || "unknown";
+  return canonicalShop(url.searchParams.get("shop") || "unknown");
 }
 
 /**

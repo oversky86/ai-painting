@@ -6,8 +6,7 @@ import {
   getShopFromProxy,
   getCustomerIdFromProxy,
 } from "../utils/app-proxy-verify";
-
-const DEV_SHOP = "e-commerce-dev-v6yidmlw.myshopify.com";
+import { DEV_SHOP, LIVE_SHOP } from "../utils/shops.server";
 
 type Money = { amount: string; currencyCode: string };
 
@@ -42,7 +41,7 @@ export async function loader({ request }: LoaderFunctionArgs) {
   }
 
   const shop = getShopFromProxy(request);
-  if (shop !== DEV_SHOP) {
+  if (shop !== DEV_SHOP && shop !== LIVE_SHOP) {
     return json({ ok: false, error: "Shop not allowed" }, 403, request);
   }
 

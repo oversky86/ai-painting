@@ -1,8 +1,8 @@
-# ai-painting App — 正式店铺 w4yzmt-vv.myshopify.com
+# ecommerce-pet-app-prod — 线上店 6hcr01-9t.myshopify.com
 # 与 ecommerce-pet-app 共用同一 Vercel 后端
 
-client_id = "95a4a9972a0fc9d0d899293e2b62644f"
-name = "ai-painting"
+client_id = "a82e09b2fd0499c59c41187578e65b80"
+name = "ecommerce-pet-app-prod"
 application_url = "https://pet-paiting-app.vercel.app"
 embedded = true
 

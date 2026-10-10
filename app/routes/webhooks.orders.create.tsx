@@ -10,9 +10,11 @@ import {
   normalizeBusinessStatus,
   type BusinessStatus,
 } from "../utils/business-status.server";
+import { canonicalShop } from "../utils/shops.server";
 
 export const action = async ({ request }: ActionFunctionArgs) => {
-  const { topic, shop, payload, admin } = await authenticate.webhook(request);
+  const { topic, shop: rawShop, payload, admin } = await authenticate.webhook(request);
+  const shop = canonicalShop(rawShop);
 
   if (topic !== "ORDERS_CREATE") {
     throw new Response("Unhandled webhook topic", { status: 404 });

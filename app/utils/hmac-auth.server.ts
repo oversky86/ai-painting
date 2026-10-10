@@ -1,4 +1,5 @@
 import { createHmac, timingSafeEqual } from "node:crypto";
+import { canonicalShop, DEV_SHOP, isRetiredShop, LIVE_SHOP } from "./shops.server";
 
 const MAX_SKEW_SEC = 300;
 
@@ -85,7 +86,7 @@ export function assertSupplierHmac(
 }
 
 export function allowedWriteShops(): string[] {
-  return (
+  const fromEnv = (
     process.env.ACCOUNT_WRITE_SHOPS ||
     process.env.ACCOUNT_WRITE_SHOP ||
     process.env.SHOP_CUSTOM_DOMAIN ||
@@ -93,25 +94,17 @@ export function allowedWriteShops(): string[] {
     ""
   )
     .split(",")
-    .map((s) =>
-      s
-        .trim()
-        .replace(/^https?:\/\//, "")
-        .replace(/\/$/, "")
-        .toLowerCase(),
-    )
-    .filter(Boolean);
+    .map((s) => canonicalShop(s))
+    .filter((s) => s && !isRetiredShop(s));
+  return [...new Set([DEV_SHOP, LIVE_SHOP, ...fromEnv])];
 }
 
 export function resolveAllowedShop(requested?: string | null): string | null {
   const shops = allowedWriteShops();
   if (!shops.length) return null;
-  const normalized = (requested || "")
-    .trim()
-    .replace(/^https?:\/\//, "")
-    .replace(/\/$/, "")
-    .toLowerCase();
-  if (!normalized) return shops[0];
+  const normalized = canonicalShop(requested || "");
+  if (!normalized || normalized === "unknown") return shops[0];
+  if (isRetiredShop(normalized)) return null;
   return shops.find((s) => s === normalized) || null;
 }
 
