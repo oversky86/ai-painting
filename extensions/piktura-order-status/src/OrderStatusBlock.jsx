@@ -9,12 +9,27 @@ export default async () => {
 /** Period 1 Vercel URL; update when ACCOUNT_WEB_URL / subdomain changes. */
 const ACCOUNT_WEB_URL = "https://ai-painting-account.vercel.app";
 
+function publicShopKey(shopDomain) {
+  const host = String(shopDomain || "").trim().toLowerCase().replace(/^https?:\/\//, "").split("/")[0];
+  if (!host) return undefined;
+  if (
+    host === "6hcr01-9t.myshopify.com" ||
+    host === "view-brush.myshopify.com" ||
+    host === "viewbrush.com" ||
+    host === "www.viewbrush.com"
+  ) {
+    return "prod";
+  }
+  return "dev";
+}
+
 function reviewHref(orderId, shopDomain) {
   if (!orderId) return undefined;
   const numeric = String(orderId).replace(/\D/g, "") || orderId;
   const url = new URL(`${ACCOUNT_WEB_URL}/orders`);
   url.searchParams.set("review", String(orderId));
-  if (shopDomain) url.searchParams.set("shop", shopDomain);
+  const shopKey = publicShopKey(shopDomain);
+  if (shopKey) url.searchParams.set("shop", shopKey);
   url.hash = numeric;
   return url.toString();
 }
