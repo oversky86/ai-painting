@@ -6,8 +6,7 @@ export default async () => {
   render(<Extension />, document.body);
 };
 
-/** Period 1 Vercel URL; update when ACCOUNT_WEB_URL / subdomain changes. */
-const ACCOUNT_WEB_URL = "https://ai-painting-account.vercel.app";
+const ACCOUNT_WEB_URL = "https://orders.viewbrush.com";
 
 function publicShopKey(shopDomain) {
   const host = String(shopDomain || "").trim().toLowerCase().replace(/^https?:\/\//, "").split("/")[0];

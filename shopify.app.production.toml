@@ -36,5 +36,8 @@ subpath = "piktura"
 prefix = "apps"
 
 [customer_authentication]
-# Period 1 Vercel URL — replace with real account-web *.vercel.app after first deploy
-redirect_uris = [ "https://ai-painting-account.vercel.app/api/auth/callback" ]
+# Keep the Vercel host until orders.viewbrush.com login is verified.
+redirect_uris = [
+  "https://orders.viewbrush.com/api/auth/callback",
+  "https://ai-painting-account.vercel.app/api/auth/callback"
+]

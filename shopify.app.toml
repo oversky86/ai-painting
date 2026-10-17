@@ -60,6 +60,8 @@ name = "Description"
 type = "multi_line_text_field"
 
 [customer_authentication]
-# Period 1: Vercel default domain for account-web (update after deploy).
-# Deferred: also add https://account.<brand-domain>/api/auth/callback
-redirect_uris = [ "https://ai-painting-account.vercel.app/api/auth/callback" ]
+# Keep the Vercel host until orders.viewbrush.com login is verified.
+redirect_uris = [
+  "https://orders.viewbrush.com/api/auth/callback",
+  "https://ai-painting-account.vercel.app/api/auth/callback"
+]
