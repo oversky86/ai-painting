@@ -546,7 +546,30 @@ export type SupplierQueueOrder = {
   placedAt: string;
   trackingCompany: string | null;
   trackingNumber: string | null;
+  /** Current AI painting for this order, when Shopify has stored one. */
+  paintingUrl: string | null;
 };
+
+function queuePaintingUrl(node: {
+  paintingUrl?: { value?: string | null } | null;
+  lineItems?: {
+    nodes?: Array<{
+      customAttributes?: Array<{ key?: string | null; value?: string | null }> | null;
+    }> | null;
+  } | null;
+}): string | null {
+  const fromMetafield = node.paintingUrl?.value?.trim();
+  if (fromMetafield) return fromMetafield;
+  for (const line of node.lineItems?.nodes || []) {
+    for (const attr of line.customAttributes || []) {
+      const key = attr.key || "";
+      const value = attr.value?.trim();
+      if (!value) continue;
+      if (key === "painting_url" || key === "source_painting_url") return value;
+    }
+  }
+  return null;
+}
 
 type TrackingInfo = { company?: string | null; number?: string | null };
 
@@ -620,6 +643,12 @@ export async function listShopifyOrdersForSupplier(
             cancelledAt
             displayFulfillmentStatus
             businessStatus: metafield(namespace: "custom", key: "business_status") { value }
+            paintingUrl: metafield(namespace: "custom", key: "painting_url") { value }
+            lineItems(first: 10) {
+              nodes {
+                customAttributes { key value }
+              }
+            }
             fulfillments(first: 5) {
               trackingInfo { company number }
             }
@@ -641,6 +670,12 @@ export async function listShopifyOrdersForSupplier(
       cancelledAt?: string | null;
       displayFulfillmentStatus?: string | null;
       businessStatus?: { value?: string | null } | null;
+      paintingUrl?: { value?: string | null } | null;
+      lineItems?: {
+        nodes?: Array<{
+          customAttributes?: Array<{ key?: string | null; value?: string | null }> | null;
+        }> | null;
+      } | null;
       fulfillments?: Array<{ trackingInfo?: TrackingInfo[] | null }> | null;
     }> = connection?.nodes || [];
 
@@ -660,6 +695,7 @@ export async function listShopifyOrdersForSupplier(
         placedAt: node.createdAt,
         trackingCompany: tracking.company,
         trackingNumber: tracking.number,
+        paintingUrl: queuePaintingUrl(node),
       });
     }
 

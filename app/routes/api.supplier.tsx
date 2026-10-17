@@ -133,6 +133,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
             placedAt: row.placedAt,
             trackingCompany: row.trackingCompany,
             trackingNumber: row.trackingNumber,
+            paintingUrl: row.paintingUrl,
           };
         }),
       });
