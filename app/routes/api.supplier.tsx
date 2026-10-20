@@ -182,7 +182,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       metafieldStatus,
       shopifyOrder.displayFulfillmentStatus,
     );
-    await syncBusinessStatusMetafield(admin, { id: ownerId, metafieldStatus, businessStatus });
+    await syncBusinessStatusMetafield(admin, shop, { id: ownerId, metafieldStatus, businessStatus });
 
     let index = await getSupplierOrder(shop, shopifyOrderId);
     if (!index) {
@@ -364,7 +364,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     const gate = await loadWritableGate();
     if (gate instanceof Response) return gate;
     if (gate.businessStatus === "shipped") {
-      await syncBusinessStatusMetafield(admin, gate);
+      await syncBusinessStatusMetafield(admin, shop, gate);
       return json({ ok: false, error: "This order is already fulfilled in Shopify." }, 409);
     }
     const index = await loadIndex(gate);

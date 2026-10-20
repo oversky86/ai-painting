@@ -4,6 +4,7 @@ import { normalizeBusinessStatus, type BusinessStatus } from "./business-status.
 import { effectiveBusinessStatus, trackingFromFulfillments } from "./shopify-order.server";
 import { buildPortraitHistories, type PortraitHistory } from "./portrait-history.server";
 import { orderNumericId } from "./hmac-auth.server";
+import { loadOrderPortraitProgress } from "./supplier-store.server";
 import { unauthenticated } from "../shopify.server";
 
 const PURPOSE = "order_link";
@@ -102,6 +103,40 @@ export function verifyShopifyFlowHmac(rawBody: string, header: string | null): b
 
 export function publicShopKey(shop: string): "prod" | "dev" {
   return canonicalShop(shop) === LIVE_SHOP ? "prod" : "dev";
+}
+
+/** URL stored on the order for Flow. Null when the order has no customer. */
+export async function orderReviewLinkValue(
+  admin: AdminClient,
+  shop: string,
+  orderGid: string,
+  businessStatus: BusinessStatus,
+): Promise<string | null> {
+  const response = await admin.graphql(
+    `#graphql
+    query OrderLinkCustomer($id: ID!) {
+      order(id: $id) {
+        customer { id }
+      }
+    }`,
+    { variables: { id: orderGid } },
+  );
+  const json = await response.json();
+  const customerId = json?.data?.order?.customer?.id;
+  if (typeof customerId !== "string" || !customerId) return null;
+  const canonical = canonicalShop(shop);
+  const progress = await loadOrderPortraitProgress(
+    canonical,
+    orderNumericId(orderGid),
+    businessStatus,
+  );
+  return orderLinkUrl({
+    shop: canonical,
+    orderId: orderGid,
+    customerId,
+    version: progress.versionCount,
+    exp: Math.floor(Date.now() / 1000) + SEVEN_DAYS_SEC,
+  });
 }
 
 export function orderLinkUrl(claims: Omit<OrderLinkClaims, "purpose">): string {

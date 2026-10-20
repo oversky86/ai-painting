@@ -79,7 +79,7 @@ export async function runTransition<T = undefined>(input: {
   }
 
   try {
-    await setOrderBusinessStatus(admin, ownerId, next);
+    await setOrderBusinessStatus(admin, index.shop, ownerId, next);
   } catch (err) {
     console.error("[transition] metafield write failed", ownerId, next, err);
     const landed = await getOrderBusinessStatus(admin, ownerId).catch(() => null);

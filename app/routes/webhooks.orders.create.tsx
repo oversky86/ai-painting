@@ -3,9 +3,11 @@ import { authenticate } from "../shopify.server";
 import { upsertSupplierOrder } from "../utils/supplier-store.server";
 import {
   ensureBusinessStatusRepeatable,
+  ensureReviewLinkDefinition,
   isUniqueMetafieldValueError,
   readOrderBusinessStatusValue,
 } from "../utils/shopify-order.server";
+import { orderReviewLinkValue } from "../utils/order-link.server";
 import {
   normalizeBusinessStatus,
   type BusinessStatus,
@@ -70,12 +72,24 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       const existingStatus = await readOrderBusinessStatusValue(admin, ownerId);
       if (existingStatus) businessStatus = normalizeBusinessStatus(existingStatus);
 
+      const reviewLink = existingStatus
+        ? null
+        : await orderReviewLinkValue(admin, shop, ownerId, "order_placed");
+      if (reviewLink) await ensureReviewLinkDefinition(admin, shop);
+
       const metafields = [
         !existingStatus && {
           ownerId,
           namespace: "custom",
           key: "business_status",
           value: "order_placed",
+          type: "single_line_text_field",
+        },
+        reviewLink && {
+          ownerId,
+          namespace: "custom",
+          key: "review_link",
+          value: reviewLink,
           type: "single_line_text_field",
         },
         customAttrs.original_photo_url && {
