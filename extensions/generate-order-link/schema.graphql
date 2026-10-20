@@ -1,0 +1,5 @@
+"""A 7-day link that opens one order on the account site."""
+type OrderLink {
+  """URL to include in the customer email."""
+  review_url: String!
+}

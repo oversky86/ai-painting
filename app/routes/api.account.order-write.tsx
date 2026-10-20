@@ -22,6 +22,8 @@ import {
 } from "../utils/supplier-store.server";
 import { buildPortraitHistories } from "../utils/portrait-history.server";
 import { runTransition } from "../utils/status-transition.server";
+import { readOrderLink } from "../utils/order-link.server";
+import { canonicalShop } from "../utils/shops.server";
 
 const MAX_BATCH_ORDERS = 25;
 
@@ -122,6 +124,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     orderId?: string;
     orderIds?: string[];
     customerId?: string;
+    orderLinkToken?: string;
     action?: "approve" | "modify";
     note?: string;
     notes?: NoteInput[];
@@ -149,14 +152,21 @@ export const action = async ({ request }: ActionFunctionArgs) => {
   }
 
   const isBatch = body.type === "portrait_history_batch";
-  if (!body.type || !body.customerId || (!isBatch && !body.orderId)) {
+  const linkClaims = body.orderLinkToken ? readOrderLink(body.orderLinkToken) : null;
+  if (body.orderLinkToken && !linkClaims) {
+    return json({ ok: false, error: "invalid_token" }, 401);
+  }
+  if (linkClaims && body.type !== "review") {
+    return json({ ok: false, error: "Forbidden" }, 403);
+  }
+  if (!body.type || (!linkClaims && !body.customerId) || (!isBatch && !body.orderId)) {
     return json(
       { ok: false, error: "type, orderId, and customerId are required" },
       400,
     );
   }
 
-  const shop = resolveAllowedShop(body.shop);
+  const shop = resolveAllowedShop(linkClaims?.shop || body.shop);
   if (!shop) {
     return json({ ok: false, error: "Shop not allowed" }, 403);
   }
@@ -173,7 +183,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     const orderGids = [
       ...new Set((body.orderIds || []).map((id) => normalizeOrderGid(String(id)))),
     ].slice(0, MAX_BATCH_ORDERS);
-    const customerGid = normalizeCustomerGid(body.customerId);
+    const customerGid = normalizeCustomerGid(body.customerId || "");
     const gates = (await fetchOrderGates(admin, orderGids)).filter(
       (gate) => gate.customerId === customerGid,
     );
@@ -195,7 +205,12 @@ export const action = async ({ request }: ActionFunctionArgs) => {
   const orderId = String(body.orderId);
   const ownerId = normalizeOrderGid(orderId);
   const shopifyOrderId = orderNumericId(orderId);
-  const customerGid = normalizeCustomerGid(body.customerId);
+  if (linkClaims && (canonicalShop(shop) !== linkClaims.shop || ownerId !== linkClaims.orderId)) {
+    return json({ ok: false, error: "Forbidden" }, 403);
+  }
+  const customerGid = linkClaims
+    ? linkClaims.customerId
+    : normalizeCustomerGid(body.customerId || "");
 
   const ownershipResponse = await admin.graphql(
     `#graphql
@@ -257,6 +272,9 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     }
     const progress = await loadOrderPortraitProgress(shop, shopifyOrderId, current);
     const versionCount = progress.versionCount;
+    if (linkClaims && linkClaims.version !== versionCount) {
+      return json({ ok: false, error: "version_changed" }, 401);
+    }
     if (current === "portrait_review" && versionCount === 0) {
       return json(
         { ok: false, error: "No portrait has been uploaded for this order yet." },

@@ -1,0 +1,16 @@
+api_version = "2026-04"
+
+[[extensions]]
+name = "Generate order link"
+handle = "generate-order-link"
+type = "flow_action"
+description = "Create a 7-day link to one order"
+runtime_url = "/api/flow/review-link"
+schema = "./schema.graphql"
+return_type_ref = "OrderLink"
+
+[settings]
+
+  [[settings.fields]]
+  type = "order_reference"
+  required = true
