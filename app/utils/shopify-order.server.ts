@@ -570,7 +570,8 @@ export async function createOrderFulfillment(
               company: tracking.company.slice(0, 100),
               number: tracking.number.slice(0, 100),
             },
-            notifyCustomer: true,
+            // Filling in tracking must not send Shopify's shipping confirmation.
+            notifyCustomer: false,
           },
         },
       },

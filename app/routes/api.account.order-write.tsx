@@ -24,6 +24,7 @@ import { buildPortraitHistories } from "../utils/portrait-history.server";
 import { runTransition } from "../utils/status-transition.server";
 import { readOrderLink } from "../utils/order-link.server";
 import { canonicalShop } from "../utils/shops.server";
+import { chargeRemainingBalance } from "../utils/balance-charge.server";
 
 const MAX_BATCH_ORDERS = 25;
 
@@ -283,6 +284,17 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     }
 
     if (body.action === "approve") {
+      try {
+        await chargeRemainingBalance(shop, ownerId);
+      } catch (err) {
+        return json(
+          {
+            ok: false,
+            error: err instanceof Error ? err.message : "The remaining balance could not be collected. Please try again.",
+          },
+          502,
+        );
+      }
       const outcome = await runTransition({
         admin,
         ownerId,
