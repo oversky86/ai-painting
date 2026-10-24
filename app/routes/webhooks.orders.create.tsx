@@ -72,9 +72,14 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       const existingStatus = await readOrderBusinessStatusValue(admin, ownerId);
       if (existingStatus) businessStatus = normalizeBusinessStatus(existingStatus);
 
-      const reviewLink = existingStatus
-        ? null
-        : await orderReviewLinkValue(admin, shop, ownerId, "order_placed");
+      let reviewLink: string | null = null;
+      if (!existingStatus) {
+        try {
+          reviewLink = await orderReviewLinkValue(admin, shop, ownerId, "order_placed");
+        } catch (err) {
+          console.error("[Webhook] review link skipped", ownerId, err);
+        }
+      }
       if (reviewLink) await ensureReviewLinkDefinition(admin, shop);
 
       const metafields = [

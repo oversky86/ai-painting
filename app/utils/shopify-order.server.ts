@@ -277,118 +277,80 @@ export async function ensureBusinessStatusRepeatable(
 
 const reviewLinkReady = new Set<string>();
 
-function reviewLinkAccessOk(access: {
-  admin?: string | null;
-  storefront?: string | null;
-  customerAccount?: string | null;
-} | null | undefined): boolean {
-  return (
-    access?.admin === "MERCHANT_READ" &&
-    (access.storefront || "NONE") === "NONE" &&
-    (access.customerAccount || "NONE") === "NONE"
-  );
-}
-
-/** Merchant-only order metafield that Flow emails read. Created on first use for each shop. */
+/**
+ * `custom` is a merchant namespace, so Shopify rejects access.admin other than
+ * public read-write. Storefront and customer-account reads stay closed.
+ * A definition problem must not block the business-status write.
+ */
 export async function ensureReviewLinkDefinition(
   admin: AdminClient,
   shop: string,
 ): Promise<void> {
   if (reviewLinkReady.has(shop)) return;
-  const found = await admin.graphql(
-    `#graphql
-    query FindReviewLinkDef {
-      metafieldDefinitions(
-        first: 1
-        ownerType: ORDER
-        namespace: "custom"
-        key: "review_link"
-      ) {
-        nodes {
-          id
-          access { admin storefront customerAccount }
-        }
-      }
-    }`,
-  );
-  const foundJson = await found.json();
-  const foundError = firstGraphqlMessage(foundJson);
-  if (foundError) throw new Error(foundError);
-  const def = foundJson?.data?.metafieldDefinitions?.nodes?.[0];
-  if (def?.id && reviewLinkAccessOk(def.access)) {
-    reviewLinkReady.add(shop);
-    return;
-  }
-
-  if (def?.id) {
-    const updated = await admin.graphql(
+  try {
+    const found = await admin.graphql(
       `#graphql
-      mutation RestrictReviewLink($definition: MetafieldDefinitionUpdateInput!) {
-        metafieldDefinitionUpdate(definition: $definition) {
-          updatedDefinition { id access { admin storefront customerAccount } }
-          userErrors { message }
+      query FindReviewLinkDef {
+        metafieldDefinitions(
+          first: 1
+          ownerType: ORDER
+          namespace: "custom"
+          key: "review_link"
+        ) {
+          nodes { id }
         }
       }`,
-      {
-        variables: {
-          definition: {
-            id: def.id,
-            access: {
-              admin: "MERCHANT_READ",
-              storefront: "NONE",
-              customerAccount: "NONE",
+    );
+    const foundJson = await found.json();
+    const foundError = firstGraphqlMessage(foundJson);
+    if (foundError) throw new Error(foundError);
+    if (foundJson?.data?.metafieldDefinitions?.nodes?.[0]?.id) {
+      reviewLinkReady.add(shop);
+      return;
+    }
+
+    const create = (access?: { storefront: "NONE"; customerAccount: "NONE" }) =>
+      admin.graphql(
+        `#graphql
+        mutation CreateReviewLink($definition: MetafieldDefinitionInput!) {
+          metafieldDefinitionCreate(definition: $definition) {
+            createdDefinition { id }
+            userErrors { message code }
+          }
+        }`,
+        {
+          variables: {
+            definition: {
+              name: "Order link",
+              namespace: "custom",
+              key: "review_link",
+              description: "7-day link to this order on the account site",
+              type: "single_line_text_field",
+              ownerType: "ORDER",
+              ...(access ? { access } : {}),
             },
           },
         },
-      },
+      );
+
+    let createdJson = await (await create({ storefront: "NONE", customerAccount: "NONE" })).json();
+    let createErrors = createdJson?.data?.metafieldDefinitionCreate?.userErrors || [];
+    if (firstGraphqlMessage(createdJson) || createErrors.length) {
+      createdJson = await (await create()).json();
+      createErrors = createdJson?.data?.metafieldDefinitionCreate?.userErrors || [];
+    }
+    const createError = firstGraphqlMessage(createdJson);
+    if (createError) throw new Error(createError);
+    const duplicate = createErrors.some(
+      (error: { code?: string }) => error.code === "TAKEN" || error.code === "DUPLICATE",
     );
-    const updatedJson = await updated.json();
-    const updateError = firstGraphqlMessage(updatedJson);
-    const updateErrors = updatedJson?.data?.metafieldDefinitionUpdate?.userErrors;
-    if (updateError || updateErrors?.length) {
-      throw new Error(updateError || updateErrors[0].message || "Could not restrict review_link");
+    if (createErrors.length && !duplicate) {
+      throw new Error(createErrors[0].message || "Could not create review_link");
     }
     reviewLinkReady.add(shop);
-    return;
+  } catch (err) {
+    console.error("[shopify-order] review_link definition skipped", shop, err);
   }
-
-  const created = await admin.graphql(
-    `#graphql
-    mutation CreateReviewLink($definition: MetafieldDefinitionInput!) {
-      metafieldDefinitionCreate(definition: $definition) {
-        createdDefinition { id access { admin storefront customerAccount } }
-        userErrors { message code }
-      }
-    }`,
-    {
-      variables: {
-        definition: {
-          name: "Order link",
-          namespace: "custom",
-          key: "review_link",
-          description: "7-day link to this order on the account site",
-          type: "single_line_text_field",
-          ownerType: "ORDER",
-          access: {
-            admin: "MERCHANT_READ",
-            storefront: "NONE",
-            customerAccount: "NONE",
-          },
-        },
-      },
-    },
-  );
-  const createdJson = await created.json();
-  const createError = firstGraphqlMessage(createdJson);
-  if (createError) throw new Error(createError);
-  const createErrors = createdJson?.data?.metafieldDefinitionCreate?.userErrors || [];
-  const duplicate = createErrors.some(
-    (error: { code?: string }) => error.code === "TAKEN" || error.code === "DUPLICATE",
-  );
-  if (createErrors.length && !duplicate) {
-    throw new Error(createErrors[0].message || "Could not create review_link");
-  }
-  reviewLinkReady.add(shop);
 }
 
 async function writeOrderBusinessStatus(
@@ -440,16 +402,33 @@ export async function setOrderBusinessStatus(
   status: BusinessStatus,
 ): Promise<void> {
   const { orderReviewLinkValue } = await import("./order-link.server");
-  const reviewLink = await orderReviewLinkValue(admin, shop, orderGid, status);
+  let reviewLink: string | null = null;
+  try {
+    reviewLink = await orderReviewLinkValue(admin, shop, orderGid, status);
+  } catch (err) {
+    console.error("[shopify-order] review link skipped", orderGid, err);
+  }
   if (reviewLink) await ensureReviewLinkDefinition(admin, shop);
   try {
     await writeOrderBusinessStatus(admin, orderGid, status, reviewLink);
   } catch (err) {
     const message = err instanceof Error ? err.message : "";
-    if (!isUniqueMetafieldValueError(message)) throw err;
-    const relaxed = await ensureBusinessStatusRepeatable(admin);
-    if (!relaxed.ok) throw err;
-    await writeOrderBusinessStatus(admin, orderGid, status, reviewLink);
+    if (isUniqueMetafieldValueError(message)) {
+      const relaxed = await ensureBusinessStatusRepeatable(admin);
+      if (!relaxed.ok) throw err;
+      try {
+        await writeOrderBusinessStatus(admin, orderGid, status, reviewLink);
+        return;
+      } catch (retryErr) {
+        if (!reviewLink) throw retryErr;
+        console.error("[shopify-order] review link write skipped", orderGid, retryErr);
+        await writeOrderBusinessStatus(admin, orderGid, status, null);
+        return;
+      }
+    }
+    if (!reviewLink) throw err;
+    console.error("[shopify-order] review link write skipped", orderGid, err);
+    await writeOrderBusinessStatus(admin, orderGid, status, null);
   }
 }
 
