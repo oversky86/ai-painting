@@ -881,6 +881,7 @@ export type SupplierQueueOrder = {
   placedAt: string;
   trackingCompany: string | null;
   trackingNumber: string | null;
+  trackingUrl: string | null;
   /** Current AI painting for this order, when Shopify has stored one. */
   paintingUrl: string | null;
 };
@@ -906,16 +907,22 @@ function queuePaintingUrl(node: {
   return null;
 }
 
-type TrackingInfo = { company?: string | null; number?: string | null };
+type TrackingInfo = { company?: string | null; number?: string | null; url?: string | null };
 
 export function trackingFromFulfillments(
   fulfillments: Array<{ trackingInfo?: TrackingInfo[] | null }> | null | undefined,
-): { company: string | null; number: string | null } {
+): { company: string | null; number: string | null; url: string | null } {
   for (const fulfillment of fulfillments || []) {
     const info = (fulfillment.trackingInfo || []).find((item) => item.company || item.number);
-    if (info) return { company: info.company || null, number: info.number || null };
+    if (info) {
+      return {
+        company: info.company || null,
+        number: info.number || null,
+        url: info.url || null,
+      };
+    }
   }
-  return { company: null, number: null };
+  return { company: null, number: null, url: null };
 }
 
 type QueueTab = "action" | "waiting" | "done";
@@ -923,31 +930,36 @@ type QueueTab = "action" | "waiting" | "done";
 const OPEN_WORK_QUERY =
   "-status:cancelled -fulfillment_status:fulfilled -financial_status:refunded -financial_status:voided";
 
+const FULFILLED_QUERY = "-status:cancelled fulfillment_status:fulfilled";
+
+type QueuePass = { query: string; reverse: boolean; pages: number };
+
 /**
- * Open tabs scan unfulfilled, unrefunded orders oldest first so nothing waiting
- * drops off; the done tab shows the most recent fulfilled orders.
+ * Shipped orders are already fulfilled in Shopify, so the open-work query cannot
+ * see them. They stay in the action queue until the supplier marks them delivered.
+ * Delivered and archived orders are the done queue.
  */
 const QUEUE_TABS: Record<
   QueueTab,
-  { statuses: BusinessStatus[]; query: string; reverse: boolean; pages: number }
+  { statuses: BusinessStatus[]; passes: QueuePass[]; reverse: boolean }
 > = {
   action: {
-    statuses: ["order_placed", "supplier_modification", "prepare_shipment"],
-    query: OPEN_WORK_QUERY,
+    statuses: ["order_placed", "supplier_modification", "prepare_shipment", "shipped"],
     reverse: false,
-    pages: 8,
+    passes: [
+      { query: OPEN_WORK_QUERY, reverse: false, pages: 8 },
+      { query: FULFILLED_QUERY, reverse: false, pages: 8 },
+    ],
   },
   waiting: {
     statuses: ["portrait_review"],
-    query: OPEN_WORK_QUERY,
     reverse: false,
-    pages: 8,
+    passes: [{ query: OPEN_WORK_QUERY, reverse: false, pages: 8 }],
   },
   done: {
-    statuses: ["shipped", "delivered"],
-    query: "-status:cancelled fulfillment_status:fulfilled",
+    statuses: ["delivered", "archived"],
     reverse: true,
-    pages: 2,
+    passes: [{ query: FULFILLED_QUERY, reverse: true, pages: 4 }],
   },
 };
 
@@ -962,80 +974,85 @@ export async function listShopifyOrdersForSupplier(
   const config = QUEUE_TABS[tab] || QUEUE_TABS.action;
   const wanted = new Set(config.statuses);
   const rows: SupplierQueueOrder[] = [];
-  let cursor: string | null = null;
+  const seen = new Set<string>();
 
-  for (let page = 0; page < config.pages; page += 1) {
-    const response = await admin.graphql(
-      `#graphql
-      query SupplierOrderQueue($cursor: String, $query: String, $reverse: Boolean) {
-        orders(first: 50, after: $cursor, query: $query, sortKey: CREATED_AT, reverse: $reverse) {
-          pageInfo { hasNextPage endCursor }
-          nodes {
-            id
-            name
-            email
-            createdAt
-            cancelledAt
-            displayFulfillmentStatus
-            businessStatus: metafield(namespace: "custom", key: "business_status") { value }
-            paintingUrl: metafield(namespace: "custom", key: "painting_url") { value }
-            lineItems(first: 10) {
-              nodes {
-                customAttributes { key value }
+  for (const pass of config.passes) {
+    let cursor: string | null = null;
+    for (let page = 0; page < pass.pages; page += 1) {
+      const response = await admin.graphql(
+        `#graphql
+        query SupplierOrderQueue($cursor: String, $query: String, $reverse: Boolean) {
+          orders(first: 50, after: $cursor, query: $query, sortKey: CREATED_AT, reverse: $reverse) {
+            pageInfo { hasNextPage endCursor }
+            nodes {
+              id
+              name
+              email
+              createdAt
+              cancelledAt
+              displayFulfillmentStatus
+              businessStatus: metafield(namespace: "custom", key: "business_status") { value }
+              paintingUrl: metafield(namespace: "custom", key: "painting_url") { value }
+              lineItems(first: 10) {
+                nodes {
+                  customAttributes { key value }
+                }
+              }
+              fulfillments(first: 5) {
+                trackingInfo { company number url }
               }
             }
-            fulfillments(first: 5) {
-              trackingInfo { company number }
-            }
           }
-        }
-      }`,
-      { variables: { cursor, query: config.query, reverse: config.reverse } },
-    );
-    const json = await response.json();
-    if (json?.errors?.length) {
-      throw new Error(json.errors[0].message || "Failed to list Shopify orders");
-    }
-    const connection = json?.data?.orders;
-    const nodes: Array<{
-      id: string;
-      name?: string | null;
-      email?: string | null;
-      createdAt: string;
-      cancelledAt?: string | null;
-      displayFulfillmentStatus?: string | null;
-      businessStatus?: { value?: string | null } | null;
-      paintingUrl?: { value?: string | null } | null;
-      lineItems?: {
-        nodes?: Array<{
-          customAttributes?: Array<{ key?: string | null; value?: string | null }> | null;
-        }> | null;
-      } | null;
-      fulfillments?: Array<{ trackingInfo?: TrackingInfo[] | null }> | null;
-    }> = connection?.nodes || [];
-
-    for (const node of nodes) {
-      if (!node?.id || node.cancelledAt) continue;
-      const businessStatus = effectiveBusinessStatus(
-        node.businessStatus?.value,
-        node.displayFulfillmentStatus,
+        }`,
+        { variables: { cursor, query: pass.query, reverse: pass.reverse } },
       );
-      if (!wanted.has(businessStatus)) continue;
-      const tracking = trackingFromFulfillments(node.fulfillments);
-      rows.push({
-        id: node.id.split("/").pop() || node.id,
-        orderName: node.name || "",
-        email: node.email || null,
-        businessStatus,
-        placedAt: node.createdAt,
-        trackingCompany: tracking.company,
-        trackingNumber: tracking.number,
-        paintingUrl: queuePaintingUrl(node),
-      });
-    }
+      const json = await response.json();
+      if (json?.errors?.length) {
+        throw new Error(json.errors[0].message || "Failed to list Shopify orders");
+      }
+      const connection = json?.data?.orders;
+      const nodes: Array<{
+        id: string;
+        name?: string | null;
+        email?: string | null;
+        createdAt: string;
+        cancelledAt?: string | null;
+        displayFulfillmentStatus?: string | null;
+        businessStatus?: { value?: string | null } | null;
+        paintingUrl?: { value?: string | null } | null;
+        lineItems?: {
+          nodes?: Array<{
+            customAttributes?: Array<{ key?: string | null; value?: string | null }> | null;
+          }> | null;
+        } | null;
+        fulfillments?: Array<{ trackingInfo?: TrackingInfo[] | null }> | null;
+      }> = connection?.nodes || [];
 
-    if (!connection?.pageInfo?.hasNextPage) break;
-    cursor = connection.pageInfo.endCursor || null;
+      for (const node of nodes) {
+        if (!node?.id || node.cancelledAt || seen.has(node.id)) continue;
+        const businessStatus = effectiveBusinessStatus(
+          node.businessStatus?.value,
+          node.displayFulfillmentStatus,
+        );
+        if (!wanted.has(businessStatus)) continue;
+        seen.add(node.id);
+        const tracking = trackingFromFulfillments(node.fulfillments);
+        rows.push({
+          id: node.id.split("/").pop() || node.id,
+          orderName: node.name || "",
+          email: node.email || null,
+          businessStatus,
+          placedAt: node.createdAt,
+          trackingCompany: tracking.company,
+          trackingNumber: tracking.number,
+          trackingUrl: tracking.url,
+          paintingUrl: queuePaintingUrl(node),
+        });
+      }
+
+      if (!connection?.pageInfo?.hasNextPage) break;
+      cursor = connection.pageInfo.endCursor || null;
+    }
   }
 
   const priority: Record<string, number> = {
@@ -1045,6 +1062,7 @@ export async function listShopifyOrdersForSupplier(
     portrait_review: 3,
     shipped: 4,
     delivered: 5,
+    archived: 6,
   };
   return rows.sort((a, b) => {
     const diff = (priority[a.businessStatus] ?? 9) - (priority[b.businessStatus] ?? 9);
@@ -1097,7 +1115,7 @@ export async function fetchOrderDetailForSupplier(
           value
         }
         fulfillments(first: 5) {
-          trackingInfo { company number }
+          trackingInfo { company number url }
         }
       }
     }`,

@@ -171,6 +171,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
             statusEnteredAt: statusEnteredAt(trails.get(row.id) || [], row.businessStatus, row.placedAt),
             trackingCompany: row.trackingCompany,
             trackingNumber: row.trackingNumber,
+            trackingUrl: row.trackingUrl,
             paintingUrl: row.paintingUrl,
           };
         }),
@@ -283,6 +284,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
         nextVersion: progress.nextVersion,
         trackingCompany: tracking.company,
         trackingNumber: tracking.number,
+        trackingUrl: tracking.url,
         statusEnteredAt: statusEnteredAt(trail, businessStatus, shopifyOrder.createdAt),
         events: trail.map((event) => {
           const version = progress.versions.find((item) => item.id === event.portrait_version_id);
