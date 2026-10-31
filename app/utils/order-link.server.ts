@@ -275,6 +275,32 @@ export async function loadOrderLinkSnapshot(
   return { snapshot, version };
 }
 
+/** Newest orders for this customer. The email link still only authorizes one of them. */
+export async function listCustomerOrderIds(
+  admin: AdminClient,
+  customerId: string,
+): Promise<string[]> {
+  const numeric = customerId.split("/").pop() || "";
+  if (!/^\d+$/.test(numeric)) return [];
+  const response = await admin.graphql(
+    `#graphql
+    query CustomerOrderIds($query: String!) {
+      orders(first: 25, query: $query, sortKey: CREATED_AT, reverse: true) {
+        nodes { id customer { id } }
+      }
+    }`,
+    { variables: { query: `customer_id:${numeric}` } },
+  );
+  const json = await response.json();
+  const nodes = (json?.data?.orders?.nodes || []) as Array<{
+    id?: string;
+    customer?: { id?: string | null } | null;
+  }>;
+  return nodes
+    .filter((node) => node.id && node.customer?.id === customerId)
+    .map((node) => node.id as string);
+}
+
 export async function adminForOrderLink(shop: string) {
   return unauthenticated.admin(shop);
 }

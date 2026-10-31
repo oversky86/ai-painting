@@ -2,6 +2,7 @@ import type { ActionFunctionArgs } from "react-router";
 import { assertAccountHmac, normalizeOrderGid } from "../utils/hmac-auth.server";
 import {
   adminForOrderLink,
+  listCustomerOrderIds,
   loadOrderLinkSnapshot,
   publicShopKey,
   readOrderLink,
@@ -41,12 +42,27 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     if (loaded.version !== claims.version) {
       return json({ ok: false, error: "version_changed" }, 401);
     }
+    const ids = await listCustomerOrderIds(admin, claims.customerId).catch((err) => {
+      console.error("[account/order-link] customer orders skipped", err);
+      return [] as string[];
+    });
+    const ordered = ids.includes(claims.orderId) ? ids : [claims.orderId, ...ids];
+    const orders = [];
+    for (const id of ordered) {
+      if (id === loaded.snapshot.id) {
+        orders.push(loaded.snapshot);
+        continue;
+      }
+      const next = await loadOrderLinkSnapshot(admin, claims.shop, id).catch(() => null);
+      if (next?.snapshot.customerId === claims.customerId) orders.push(next.snapshot);
+    }
     return json({
       ok: true,
       shop: claims.shop,
       shopKey: publicShopKey(claims.shop),
       exp: claims.exp,
       order: loaded.snapshot,
+      orders,
     });
   } catch (err) {
     console.error("[account/order-link]", err);
