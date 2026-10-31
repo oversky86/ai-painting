@@ -1,10 +1,6 @@
 import type { ActionFunctionArgs } from "react-router";
 import { authenticate } from "../shopify.server";
-import {
-  insertOrderStatusEvent,
-  listOrderStatusEvents,
-  upsertSupplierOrder,
-} from "../utils/supplier-store.server";
+import { recordOrderPlaced } from "../utils/supplier-store.server";
 import {
   ensureBusinessStatusRepeatable,
   ensureReviewLinkDefinition,
@@ -165,28 +161,16 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     }
 
     try {
-      await upsertSupplierOrder({
+      await recordOrderPlaced({
         shop,
         shopifyOrderId,
         orderName: orderPayload.name || `#${shopifyOrderId}`,
         customerEmail: orderPayload.email || null,
         businessStatus,
         placedAt: orderPayload.created_at,
+        skipEvent: Boolean(existingStatus),
+        detail: { style: customAttrs.style || null },
       });
-      if (!existingStatus) {
-        const trail = await listOrderStatusEvents(shop, shopifyOrderId);
-        if (!trail.some((event) => event.to_status === "order_placed")) {
-          await insertOrderStatusEvent({
-            shop,
-            shopifyOrderId,
-            fromStatus: null,
-            toStatus: "order_placed",
-            actor: "system",
-            occurredAt: orderPayload.created_at,
-            detail: { style: customAttrs.style || null },
-          });
-        }
-      }
     } catch (indexError) {
       console.error("[Webhook] supplier_orders upsert failed:", indexError);
     }

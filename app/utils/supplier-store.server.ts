@@ -78,6 +78,137 @@ function newId(prefix: string) {
   return `${prefix}_${crypto.randomUUID().replace(/-/g, "")}`;
 }
 
+async function rpc(name: string, payload: Record<string, unknown>) {
+  const { data, error } = await getClient().rpc(name, { payload });
+  if (error) throw new Error(error.message);
+  return data;
+}
+
+export type TransitionBundle = {
+  actor: StatusEventActor;
+  occurredAt?: string;
+  detail?: Record<string, unknown>;
+  staleVersionIds?: string[];
+  staleRequestIds?: string[];
+  portrait?: { versionNumber: number; imagePath: string; videoPath?: string | null };
+  modification?: {
+    againstVersion: number;
+    notes: Array<{
+      text: string;
+      selection: { x: number; y: number; width: number; height: number };
+    }>;
+  };
+};
+
+export type AppliedTransition = {
+  eventId: string;
+  portraitVersionId: string | null;
+  modificationRequestId: string | null;
+  order: SupplierOrderRow;
+};
+
+/** Status, related rows, and the trail event commit together. */
+export async function applySupplierTransition(input: {
+  order: SupplierOrderRow;
+  fromStatus: string;
+  toStatus: string;
+  bundle: TransitionBundle;
+}): Promise<AppliedTransition | null> {
+  const data = (await rpc("apply_supplier_transition", {
+    order_row_id: input.order.id,
+    from_status: input.fromStatus,
+    to_status: input.toStatus,
+    event_id: newId("se"),
+    portrait_version_id: input.bundle.portrait ? newId("pv") : "",
+    modification_request_id: input.bundle.modification ? newId("mr") : "",
+    note_id_prefix: `${newId("mn")}_`,
+    actor: input.bundle.actor,
+    occurred_at: input.bundle.occurredAt || null,
+    detail: {
+      ...(input.bundle.detail || {}),
+      ...(input.bundle.portrait
+        ? { versionNumber: input.bundle.portrait.versionNumber }
+        : {}),
+      ...(input.bundle.modification
+        ? {
+            againstVersion: input.bundle.modification.againstVersion,
+            noteCount: input.bundle.modification.notes.length,
+          }
+        : {}),
+    },
+    stale_version_ids: input.bundle.staleVersionIds || [],
+    stale_request_ids: input.bundle.staleRequestIds || [],
+    portrait: input.bundle.portrait
+      ? {
+          version_number: input.bundle.portrait.versionNumber,
+          image_path: input.bundle.portrait.imagePath,
+          video_path: input.bundle.portrait.videoPath || "",
+        }
+      : null,
+    modification: input.bundle.modification
+      ? {
+          against_version: input.bundle.modification.againstVersion,
+          notes: input.bundle.modification.notes,
+        }
+      : null,
+  })) as {
+    ok?: boolean;
+    event_id?: string;
+    portrait_version_id?: string | null;
+    modification_request_id?: string | null;
+    order?: SupplierOrderRow;
+  } | null;
+  if (!data?.ok || !data.order || !data.event_id) return null;
+  return {
+    eventId: data.event_id,
+    portraitVersionId: data.portrait_version_id || null,
+    modificationRequestId: data.modification_request_id || null,
+    order: data.order,
+  };
+}
+
+export async function revertSupplierTransition(input: {
+  orderRowId: string;
+  fromStatus: string;
+  toStatus: string;
+  eventId: string;
+  portraitVersionId?: string | null;
+  modificationRequestId?: string | null;
+}): Promise<void> {
+  await rpc("revert_supplier_transition", {
+    order_row_id: input.orderRowId,
+    from_status: input.fromStatus,
+    to_status: input.toStatus,
+    event_id: input.eventId,
+    portrait_version_id: input.portraitVersionId || "",
+    modification_request_id: input.modificationRequestId || "",
+  });
+}
+
+export async function recordOrderPlaced(input: {
+  shop: string;
+  shopifyOrderId: string;
+  orderName?: string;
+  customerEmail?: string | null;
+  businessStatus?: string;
+  placedAt?: string;
+  skipEvent?: boolean;
+  detail?: Record<string, unknown>;
+}): Promise<void> {
+  await rpc("record_order_placed", {
+    order_row_id: newId("so"),
+    event_id: newId("se"),
+    shop: input.shop,
+    shopify_order_id: input.shopifyOrderId,
+    order_name: input.orderName || "",
+    customer_email: input.customerEmail || "",
+    business_status: input.businessStatus || "order_placed",
+    placed_at: input.placedAt || null,
+    skip_event: input.skipEvent ? "true" : "false",
+    detail: input.detail || {},
+  });
+}
+
 /**
  * Creates the index row, or refreshes name/email on an existing one.
  * `businessStatus` only seeds new rows; status changes go through `claimStatus`.
@@ -710,26 +841,15 @@ export async function ensureStatusTrail(input: {
   const existing = await listOrderStatusEvents(input.shop, input.shopifyOrderId);
   if (existing.length) return existing;
   const placedAt = input.placedAt || new Date().toISOString();
-  await insertOrderStatusEvent({
+  await rpc("ensure_status_trail", {
     shop: input.shop,
-    shopifyOrderId: input.shopifyOrderId,
-    fromStatus: null,
-    toStatus: "order_placed",
-    actor: "system",
-    occurredAt: placedAt,
-    detail: { backfill: true },
+    shopify_order_id: input.shopifyOrderId,
+    placed_event_id: newId("se"),
+    current_event_id: newId("se"),
+    placed_at: placedAt,
+    updated_at: input.updatedAt || placedAt,
+    current_status: input.currentStatus,
   });
-  if (input.currentStatus !== "order_placed") {
-    await insertOrderStatusEvent({
-      shop: input.shop,
-      shopifyOrderId: input.shopifyOrderId,
-      fromStatus: null,
-      toStatus: input.currentStatus,
-      actor: "system",
-      occurredAt: input.updatedAt || placedAt,
-      detail: { backfill: true, gap: true },
-    });
-  }
   return listOrderStatusEvents(input.shop, input.shopifyOrderId);
 }
 

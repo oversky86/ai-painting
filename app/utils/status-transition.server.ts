@@ -4,13 +4,11 @@ import {
   setOrderBusinessStatus,
 } from "./shopify-order.server";
 import {
-  ConflictError,
-  claimStatus,
-  insertOrderStatusEvent,
+  applySupplierTransition,
   reconcileSupplierOrder,
-  restoreSupplierOrder,
-  type StatusEventActor,
+  revertSupplierTransition,
   type SupplierOrderRow,
+  type TransitionBundle,
 } from "./supplier-store.server";
 
 type AdminClient = Parameters<typeof setOrderBusinessStatus>[0];
@@ -33,12 +31,9 @@ const BUSY_MESSAGE =
   "This order was just updated by another request. Refresh and try again.";
 
 /**
- * Moves an order `current -> next` (current = the metafield value).
- *
- * The Supabase index row is claimed first with a compare-and-set, so concurrent
- * requests get 409 instead of both passing the check. Then `apply` runs the side
- * effect (insert version, fulfill, ...), and the metafield is written last. Any
- * failure before the metafield write undoes the side effect and restores the row.
+ * Commits the database change first, then talks to Shopify.
+ * If Shopify does not reach `next`, the database write is reverted.
+ * An irreversible Shopify side effect (a created fulfillment) is kept.
  */
 export async function runTransition<T = undefined>(input: {
   admin: AdminClient;
@@ -46,18 +41,11 @@ export async function runTransition<T = undefined>(input: {
   index: SupplierOrderRow;
   current: BusinessStatus;
   next: BusinessStatus;
+  bundle: TransitionBundle;
+  /** Shopify work that cannot sit inside the database transaction. */
   apply?: () => Promise<T>;
-  undo?: (result: T) => Promise<void>;
-  /** The side effect cannot be undone (Shopify fulfillment): keep the claim if the metafield write fails. */
+  /** The Shopify side effect cannot be undone. Keep the database row if it succeeded. */
   irreversible?: boolean;
-  /** Written only after the status change sticks. Rolled back with the transition. */
-  record?: (result: T) => {
-    actor: StatusEventActor;
-    occurredAt?: string;
-    portraitVersionId?: string | null;
-    modificationRequestId?: string | null;
-    detail?: Record<string, unknown>;
-  };
 }): Promise<TransitionResult<T>> {
   const { admin, ownerId, current, next } = input;
   if (!canTransition(current, next)) {
@@ -69,19 +57,36 @@ export async function runTransition<T = undefined>(input: {
     return { ok: false, status: 409, error: BUSY_MESSAGE };
   }
 
-  const claimed = await claimStatus({ row: index, from: current, to: next });
-  if (!claimed) {
+  const applied = await applySupplierTransition({
+    order: index,
+    fromStatus: current,
+    toStatus: next,
+    bundle: input.bundle,
+  });
+  if (!applied) {
     return { ok: false, status: 409, error: BUSY_MESSAGE };
   }
 
+  const undoDatabase = async () => {
+    await revertSupplierTransition({
+      orderRowId: index.id,
+      fromStatus: current,
+      toStatus: next,
+      eventId: applied.eventId,
+      portraitVersionId: applied.portraitVersionId,
+      modificationRequestId: applied.modificationRequestId,
+    }).catch((err) => console.error("[transition] revert failed", ownerId, err));
+  };
+
   let result = undefined as T;
+  let shopifySideEffectDone = false;
   try {
-    if (input.apply) result = await input.apply();
-  } catch (err) {
-    await restoreSupplierOrder(index);
-    if (err instanceof ConflictError) {
-      return { ok: false, status: 409, error: BUSY_MESSAGE };
+    if (input.apply) {
+      result = await input.apply();
+      shopifySideEffectDone = true;
     }
+  } catch (err) {
+    await undoDatabase();
     if (err instanceof TransitionAbort) {
       return { ok: false, status: err.status, error: err.message };
     }
@@ -93,9 +98,8 @@ export async function runTransition<T = undefined>(input: {
   } catch (err) {
     console.error("[transition] metafield write failed", ownerId, next, err);
     const landed = await getOrderBusinessStatus(admin, ownerId).catch(() => null);
-    if (landed === next) return finish(claimed);
-
-    if (input.irreversible) {
+    if (landed === next) return { ok: true, row: applied.order, result };
+    if (input.irreversible && shopifySideEffectDone) {
       return {
         ok: false,
         status: 502,
@@ -103,12 +107,7 @@ export async function runTransition<T = undefined>(input: {
           "Shopify accepted the change, but the order status could not be saved. Refresh the order; it will catch up on its own.",
       };
     }
-    if (input.undo) {
-      await input.undo(result).catch((undoErr) =>
-        console.error("[transition] undo failed", ownerId, undoErr),
-      );
-    }
-    await restoreSupplierOrder(index);
+    await undoDatabase();
     return {
       ok: false,
       status: 502,
@@ -116,27 +115,5 @@ export async function runTransition<T = undefined>(input: {
     };
   }
 
-  return finish(claimed);
-
-  async function finish(row: SupplierOrderRow): Promise<TransitionResult<T>> {
-    if (input.record) {
-      try {
-        const recorded = input.record(result);
-        await insertOrderStatusEvent({
-          shop: index.shop,
-          shopifyOrderId: index.shopify_order_id,
-          fromStatus: current,
-          toStatus: next,
-          actor: recorded.actor,
-          occurredAt: recorded.occurredAt,
-          portraitVersionId: recorded.portraitVersionId,
-          modificationRequestId: recorded.modificationRequestId,
-          detail: recorded.detail,
-        });
-      } catch (err) {
-        console.error("[transition] status event skipped", ownerId, next, err);
-      }
-    }
-    return { ok: true, row, result };
-  }
+  return { ok: true, row: applied.order, result };
 }

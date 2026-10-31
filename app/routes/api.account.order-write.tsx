@@ -13,10 +13,7 @@ import {
   orderBlockReason,
 } from "../utils/shopify-order.server";
 import {
-  deleteModificationRequest,
-  deleteStalePortraitRows,
   getSupplierOrder,
-  insertModificationRequest,
   loadOrderPortraitProgress,
   upsertSupplierOrder,
 } from "../utils/supplier-store.server";
@@ -301,10 +298,10 @@ export const action = async ({ request }: ActionFunctionArgs) => {
         index,
         current,
         next: "prepare_shipment",
-        record: () => ({
+        bundle: {
           actor: "customer",
           detail: { versionNumber: versionCount },
-        }),
+        },
       });
       if (!outcome.ok) return json({ ok: false, error: outcome.error }, outcome.status);
       return json({ ok: true, businessStatus: "prepare_shipment", orderId: ownerId });
@@ -321,24 +318,15 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       index,
       current,
       next: "supplier_modification",
-      apply: async () => {
-        await deleteStalePortraitRows(progress);
-        return insertModificationRequest({
-          shop,
-          shopifyOrderId,
+      bundle: {
+        actor: "customer",
+        staleVersionIds: progress.staleVersionIds,
+        staleRequestIds: progress.staleRequestIds,
+        modification: {
           againstVersion: versionCount,
           notes,
-        });
-      },
-      undo: (created) => deleteModificationRequest(created.request.id),
-      record: (created) => ({
-        actor: "customer",
-        modificationRequestId: created.request.id,
-        detail: {
-          againstVersion: versionCount,
-          noteCount: created.notes.length,
         },
-      }),
+      },
     });
     if (!outcome.ok) return json({ ok: false, error: outcome.error }, outcome.status);
 

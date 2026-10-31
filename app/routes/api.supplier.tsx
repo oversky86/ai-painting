@@ -23,13 +23,10 @@ import {
 } from "../utils/shopify-order.server";
 import {
   createUploadSignedUrl,
-  deletePortraitVersion,
   uploadExtensionForContentType,
-  deleteStalePortraitRows,
   ensureStatusTrail,
   getSupplierOrder,
   getSupplierOrders,
-  insertPortraitVersion,
   listOrderStatusEventsForOrders,
   isValidUploadPath,
   loadOrderPortraitProgress,
@@ -406,22 +403,17 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       index,
       current,
       next: "portrait_review",
-      apply: async () => {
-        await deleteStalePortraitRows(progress);
-        return insertPortraitVersion({
-          shop,
-          shopifyOrderId,
+      bundle: {
+        actor: "supplier",
+        staleVersionIds: progress.staleVersionIds,
+        staleRequestIds: progress.staleRequestIds,
+        portrait: {
           versionNumber: nextVersion,
           imagePath,
           videoPath,
-        });
+        },
+        detail: { versionNumber: nextVersion },
       },
-      undo: (version) => deletePortraitVersion(version.id),
-      record: (version) => ({
-        actor: "supplier",
-        portraitVersionId: version.id,
-        detail: { versionNumber: version.version_number },
-      }),
     });
     if (!outcome.ok) return json({ ok: false, error: outcome.error }, outcome.status);
 
@@ -462,6 +454,10 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       current: gate.businessStatus,
       next: "shipped",
       irreversible: true,
+      bundle: {
+        actor: "supplier",
+        detail: { trackingCompany: company, trackingNumber: number },
+      },
       apply: async () => {
         try {
           return await createOrderFulfillment(admin, ownerId, tracking);
@@ -472,10 +468,6 @@ export const action = async ({ request }: ActionFunctionArgs) => {
           );
         }
       },
-      record: () => ({
-        actor: "supplier",
-        detail: { trackingCompany: company, trackingNumber: number },
-      }),
     });
     if (!outcome.ok) return json({ ok: false, error: outcome.error }, outcome.status);
 
@@ -494,15 +486,6 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       return json({ ok: false, error: "Only a shipped order can be marked delivered." }, 409);
     }
 
-    try {
-      await markOrderDelivered(admin, ownerId);
-    } catch (err) {
-      return json(
-        { ok: false, error: err instanceof Error ? err.message : "Could not mark the shipment delivered" },
-        422,
-      );
-    }
-
     let index = await loadIndex(gate);
     if (gate.businessStatus === "shipped") {
       const delivered = await runTransition({
@@ -511,19 +494,20 @@ export const action = async ({ request }: ActionFunctionArgs) => {
         index,
         current: "shipped",
         next: "delivered",
-        record: () => ({ actor: "supplier" }),
+        bundle: { actor: "supplier" },
+        apply: async () => {
+          try {
+            await markOrderDelivered(admin, ownerId);
+          } catch (err) {
+            throw new TransitionAbort(
+              422,
+              err instanceof Error ? err.message : "Could not mark the shipment delivered",
+            );
+          }
+        },
       });
       if (!delivered.ok) return json({ ok: false, error: delivered.error }, delivered.status);
       index = delivered.row;
-    }
-
-    try {
-      await archiveShopifyOrder(admin, ownerId);
-    } catch (err) {
-      return json(
-        { ok: false, error: err instanceof Error ? err.message : "Could not archive the order" },
-        422,
-      );
     }
 
     const archived = await runTransition({
@@ -532,7 +516,17 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       index,
       current: "delivered",
       next: "archived",
-      record: () => ({ actor: "supplier" }),
+      bundle: { actor: "supplier" },
+      apply: async () => {
+        try {
+          await archiveShopifyOrder(admin, ownerId);
+        } catch (err) {
+          throw new TransitionAbort(
+            422,
+            err instanceof Error ? err.message : "Could not archive the order",
+          );
+        }
+      },
     });
     if (!archived.ok) return json({ ok: false, error: archived.error }, archived.status);
 
