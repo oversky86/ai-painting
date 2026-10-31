@@ -1,5 +1,8 @@
-import type { BusinessStatus } from "./business-status.server";
-import { normalizeBusinessStatus } from "./business-status.server";
+import {
+  BUSINESS_STATUSES,
+  normalizeBusinessStatus,
+  type BusinessStatus,
+} from "./business-status.server";
 
 type AdminClient = {
   graphql: (
@@ -149,6 +152,11 @@ export async function readOrderBusinessStatusValue(
 /** Shopify rejects a repeated status when the definition has unique values turned on. */
 export function isUniqueMetafieldValueError(message: string): boolean {
   return /already assigned to another metafield/i.test(message);
+}
+
+/** The choice list on the definition does not include this status yet. */
+export function isMissingStatusChoiceError(message: string): boolean {
+  return /does not exist in provided choices/i.test(message);
 }
 
 function firstGraphqlMessage(json: {
@@ -408,6 +416,94 @@ async function writeOrderBusinessStatus(
   }
 }
 
+const statusChoicesReady = new Set<string>();
+
+/**
+ * Older definitions only list the original five statuses. Add delivered and
+ * archived when that choice list is present, and leave an open text field alone.
+ */
+export async function ensureBusinessStatusChoices(
+  admin: AdminClient,
+  shop: string,
+): Promise<{ ok: boolean; message: string }> {
+  if (statusChoicesReady.has(shop)) {
+    return { ok: true, message: "business_status choices already include every status" };
+  }
+  const found = await admin.graphql(
+    `#graphql
+    query FindBusinessStatusChoices {
+      metafieldDefinitions(
+        first: 1
+        ownerType: ORDER
+        namespace: "custom"
+        key: "business_status"
+      ) {
+        nodes { validations { name value } }
+      }
+    }`,
+  );
+  const foundJson = await found.json();
+  const foundError = firstGraphqlMessage(foundJson);
+  if (foundError) return { ok: false, message: foundError };
+  const validations: Array<{ name?: string; value?: string }> =
+    foundJson?.data?.metafieldDefinitions?.nodes?.[0]?.validations || [];
+  const choices = validations.find((item) => item.name === "choices");
+  if (!choices?.value) {
+    statusChoicesReady.add(shop);
+    return { ok: true, message: "business_status has no choice list" };
+  }
+  let current: string[] = [];
+  try {
+    const parsed = JSON.parse(choices.value) as unknown;
+    current = Array.isArray(parsed)
+      ? parsed.filter((item): item is string => typeof item === "string")
+      : [];
+  } catch {
+    return { ok: false, message: "business_status choices could not be read" };
+  }
+  const missing = BUSINESS_STATUSES.filter((status) => !current.includes(status));
+  if (!missing.length) {
+    statusChoicesReady.add(shop);
+    return { ok: true, message: "business_status choices already include every status" };
+  }
+  const next = [...current];
+  for (const status of BUSINESS_STATUSES) {
+    if (!next.includes(status)) next.push(status);
+  }
+  const update = await admin.graphql(
+    `#graphql
+    mutation ExpandBusinessStatusChoices($definition: MetafieldDefinitionUpdateInput!) {
+      metafieldDefinitionUpdate(definition: $definition) {
+        updatedDefinition { id }
+        userErrors { message }
+      }
+    }`,
+    {
+      variables: {
+        definition: {
+          namespace: "custom",
+          key: "business_status",
+          ownerType: "ORDER",
+          validations: validations.map((item) =>
+            item.name === "choices"
+              ? { name: "choices", value: JSON.stringify(next) }
+              : { name: item.name, value: item.value },
+          ),
+        },
+      },
+    },
+  );
+  const updateJson = await update.json();
+  const updateError = firstGraphqlMessage(updateJson);
+  if (updateError) return { ok: false, message: updateError };
+  const userErrors = updateJson?.data?.metafieldDefinitionUpdate?.userErrors || [];
+  if (userErrors.length) {
+    return { ok: false, message: userErrors[0].message || "Could not update business_status choices" };
+  }
+  statusChoicesReady.add(shop);
+  return { ok: true, message: "business_status choices updated" };
+}
+
 export async function setOrderBusinessStatus(
   admin: AdminClient,
   shop: string,
@@ -422,10 +518,29 @@ export async function setOrderBusinessStatus(
     console.error("[shopify-order] review link skipped", orderGid, err);
   }
   if (reviewLink) await ensureReviewLinkDefinition(admin, shop);
+  await ensureBusinessStatusChoices(admin, shop).catch((err) => {
+    console.error("[shopify-order] business status choices skipped", shop, err);
+  });
   try {
     await writeOrderBusinessStatus(admin, orderGid, status, reviewLink);
   } catch (err) {
     const message = err instanceof Error ? err.message : "";
+    if (isMissingStatusChoiceError(message)) {
+      statusChoicesReady.delete(shop);
+      const expanded = await ensureBusinessStatusChoices(admin, shop);
+      if (!expanded.ok) throw err;
+      try {
+        await writeOrderBusinessStatus(admin, orderGid, status, reviewLink);
+        return;
+      } catch (retryErr) {
+        if (!reviewLink) throw retryErr;
+        const retryMessage = retryErr instanceof Error ? retryErr.message : "";
+        if (isMissingStatusChoiceError(retryMessage)) throw retryErr;
+        console.error("[shopify-order] review link write skipped", orderGid, retryErr);
+        await writeOrderBusinessStatus(admin, orderGid, status, null);
+        return;
+      }
+    }
     if (isUniqueMetafieldValueError(message)) {
       const relaxed = await ensureBusinessStatusRepeatable(admin);
       if (!relaxed.ok) throw err;
