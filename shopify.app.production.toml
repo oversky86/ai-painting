@@ -25,7 +25,7 @@ api_version = "2026-07"
   topics = [ "app/scopes_update" ]
 
 [access_scopes]
-scopes = "customer_read_customers,customer_read_orders,read_customers,read_orders,read_merchant_managed_fulfillment_orders,write_merchant_managed_fulfillment_orders,write_metaobject_definitions,write_metaobjects,write_orders,write_products"
+scopes = "customer_read_customers,customer_read_orders,read_customers,read_orders,read_merchant_managed_fulfillment_orders,write_merchant_managed_fulfillment_orders,write_fulfillments,write_metaobject_definitions,write_metaobjects,write_orders,write_products"
 
 [auth]
 redirect_urls = [ "https://pet-paiting-app.vercel.app/api/auth" ]

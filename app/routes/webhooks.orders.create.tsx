@@ -1,6 +1,10 @@
 import type { ActionFunctionArgs } from "react-router";
 import { authenticate } from "../shopify.server";
-import { upsertSupplierOrder } from "../utils/supplier-store.server";
+import {
+  insertOrderStatusEvent,
+  listOrderStatusEvents,
+  upsertSupplierOrder,
+} from "../utils/supplier-store.server";
 import {
   ensureBusinessStatusRepeatable,
   ensureReviewLinkDefinition,
@@ -66,10 +70,11 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     const shopifyOrderId = String(orderPayload.id);
     const ownerId = `gid://shopify/Order/${shopifyOrderId}`;
     let businessStatus: BusinessStatus = "order_placed";
+    let existingStatus: string | null = null;
 
     if (admin) {
       // Shopify can redeliver orders/create; never push an advanced order back to order_placed.
-      const existingStatus = await readOrderBusinessStatusValue(admin, ownerId);
+      existingStatus = await readOrderBusinessStatusValue(admin, ownerId);
       if (existingStatus) businessStatus = normalizeBusinessStatus(existingStatus);
 
       let reviewLink: string | null = null;
@@ -168,6 +173,20 @@ export const action = async ({ request }: ActionFunctionArgs) => {
         businessStatus,
         placedAt: orderPayload.created_at,
       });
+      if (!existingStatus) {
+        const trail = await listOrderStatusEvents(shop, shopifyOrderId);
+        if (!trail.some((event) => event.to_status === "order_placed")) {
+          await insertOrderStatusEvent({
+            shop,
+            shopifyOrderId,
+            fromStatus: null,
+            toStatus: "order_placed",
+            actor: "system",
+            occurredAt: orderPayload.created_at,
+            detail: { style: customAttrs.style || null },
+          });
+        }
+      }
     } catch (indexError) {
       console.error("[Webhook] supplier_orders upsert failed:", indexError);
     }

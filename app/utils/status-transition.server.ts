@@ -6,8 +6,10 @@ import {
 import {
   ConflictError,
   claimStatus,
+  insertOrderStatusEvent,
   reconcileSupplierOrder,
   restoreSupplierOrder,
+  type StatusEventActor,
   type SupplierOrderRow,
 } from "./supplier-store.server";
 
@@ -48,6 +50,14 @@ export async function runTransition<T = undefined>(input: {
   undo?: (result: T) => Promise<void>;
   /** The side effect cannot be undone (Shopify fulfillment): keep the claim if the metafield write fails. */
   irreversible?: boolean;
+  /** Written only after the status change sticks. Rolled back with the transition. */
+  record?: (result: T) => {
+    actor: StatusEventActor;
+    occurredAt?: string;
+    portraitVersionId?: string | null;
+    modificationRequestId?: string | null;
+    detail?: Record<string, unknown>;
+  };
 }): Promise<TransitionResult<T>> {
   const { admin, ownerId, current, next } = input;
   if (!canTransition(current, next)) {
@@ -83,7 +93,7 @@ export async function runTransition<T = undefined>(input: {
   } catch (err) {
     console.error("[transition] metafield write failed", ownerId, next, err);
     const landed = await getOrderBusinessStatus(admin, ownerId).catch(() => null);
-    if (landed === next) return { ok: true, row: claimed, result };
+    if (landed === next) return finish(claimed);
 
     if (input.irreversible) {
       return {
@@ -106,5 +116,27 @@ export async function runTransition<T = undefined>(input: {
     };
   }
 
-  return { ok: true, row: claimed, result };
+  return finish(claimed);
+
+  async function finish(row: SupplierOrderRow): Promise<TransitionResult<T>> {
+    if (input.record) {
+      try {
+        const recorded = input.record(result);
+        await insertOrderStatusEvent({
+          shop: index.shop,
+          shopifyOrderId: index.shopify_order_id,
+          fromStatus: current,
+          toStatus: next,
+          actor: recorded.actor,
+          occurredAt: recorded.occurredAt,
+          portraitVersionId: recorded.portraitVersionId,
+          modificationRequestId: recorded.modificationRequestId,
+          detail: recorded.detail,
+        });
+      } catch (err) {
+        console.error("[transition] status event skipped", ownerId, next, err);
+      }
+    }
+    return { ok: true, row, result };
+  }
 }

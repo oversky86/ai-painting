@@ -4,6 +4,8 @@ export const BUSINESS_STATUSES = [
   "supplier_modification",
   "prepare_shipment",
   "shipped",
+  "delivered",
+  "archived",
 ] as const;
 
 export type BusinessStatus = (typeof BUSINESS_STATUSES)[number];
@@ -13,7 +15,9 @@ const ALLOWED_TRANSITIONS: Record<BusinessStatus, BusinessStatus[]> = {
   portrait_review: ["prepare_shipment", "supplier_modification"],
   supplier_modification: ["portrait_review"],
   prepare_shipment: ["shipped"],
-  shipped: [],
+  shipped: ["delivered"],
+  delivered: ["archived"],
+  archived: [],
 };
 
 export function isBusinessStatus(value: unknown): value is BusinessStatus {

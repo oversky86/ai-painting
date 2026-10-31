@@ -8,6 +8,13 @@ type AdminClient = {
   ) => Promise<Response>;
 };
 
+/** Carrier names Shopify uses for automatic tracking links. */
+export const TRACKING_COMPANIES = ["UPS", "FedEx"] as const;
+
+export function isTrackingCompany(value: string): boolean {
+  return (TRACKING_COMPANIES as readonly string[]).includes(value);
+}
+
 export async function getOrderBusinessStatus(
   admin: AdminClient,
   orderGid: string,
@@ -15,13 +22,19 @@ export async function getOrderBusinessStatus(
   return normalizeBusinessStatus(await readOrderBusinessStatusValue(admin, orderGid));
 }
 
-/** A fully fulfilled order is shipped, whoever fulfilled it (our ship action or Shopify admin). */
+/**
+ * A fulfilled order is shipped, unless the supplier has already moved it to
+ * delivered or archived. Those metafield values stay, because a delivered
+ * order is still FULFILLED in Shopify.
+ */
 export function effectiveBusinessStatus(
   metafieldValue: string | null | undefined,
   displayFulfillmentStatus: string | null | undefined,
 ): BusinessStatus {
+  const status = normalizeBusinessStatus(metafieldValue);
+  if (status === "delivered" || status === "archived") return status;
   if ((displayFulfillmentStatus || "").toUpperCase() === "FULFILLED") return "shipped";
-  return normalizeBusinessStatus(metafieldValue);
+  return status;
 }
 
 const BLOCKED_FINANCIAL_STATUSES = new Set(["REFUNDED", "VOIDED"]);
@@ -593,6 +606,103 @@ export async function createOrderFulfillment(
   throw new Error("Nothing left to fulfill on this order. Check it in Shopify admin.");
 }
 
+type DeliveryFulfillment = {
+  id?: string;
+  status?: string | null;
+  displayStatus?: string | null;
+};
+
+/**
+ * Records a delivered shipment event on every successful fulfillment.
+ * Already-delivered shipments are left as they are.
+ */
+export async function markOrderDelivered(admin: AdminClient, orderGid: string): Promise<void> {
+  const response = await admin.graphql(
+    `#graphql
+    query OrderShipments($id: ID!) {
+      order(id: $id) {
+        id
+        fulfillments(first: 10) {
+          id
+          status
+          displayStatus
+        }
+      }
+    }`,
+    { variables: { id: orderGid } },
+  );
+  const json = await response.json();
+  const fulfillments: DeliveryFulfillment[] = json?.data?.order?.fulfillments || [];
+  const happenedAt = new Date().toISOString();
+  let touched = 0;
+  for (const fulfillment of fulfillments) {
+    if (!fulfillment.id || fulfillment.status !== "SUCCESS") continue;
+    touched += 1;
+    if (fulfillment.displayStatus === "DELIVERED") continue;
+    const created = await admin.graphql(
+      `#graphql
+      mutation MarkDelivered($fulfillmentEvent: FulfillmentEventInput!) {
+        fulfillmentEventCreate(fulfillmentEvent: $fulfillmentEvent) {
+          fulfillmentEvent { id status }
+          userErrors { field message }
+        }
+      }`,
+      {
+        variables: {
+          fulfillmentEvent: {
+            fulfillmentId: fulfillment.id,
+            status: "DELIVERED",
+            happenedAt,
+          },
+        },
+      },
+    );
+    const createdJson = await created.json();
+    const errors = createdJson?.data?.fulfillmentEventCreate?.userErrors;
+    if (errors?.length) {
+      throw new Error(errors[0].message || "Could not mark the shipment delivered");
+    }
+    if (!createdJson?.data?.fulfillmentEventCreate?.fulfillmentEvent) {
+      throw new Error(firstGraphqlMessage(createdJson) || "Could not mark the shipment delivered");
+    }
+  }
+  if (!touched) {
+    throw new Error("This order has no shipment to mark delivered");
+  }
+}
+
+/** Closes the order. Shopify admin shows a closed order as archived. */
+export async function archiveShopifyOrder(admin: AdminClient, orderGid: string): Promise<void> {
+  const found = await admin.graphql(
+    `#graphql
+    query OrderClosed($id: ID!) {
+      order(id: $id) { id closed }
+    }`,
+    { variables: { id: orderGid } },
+  );
+  const foundJson = await found.json();
+  if (foundJson?.data?.order?.closed) return;
+
+  const response = await admin.graphql(
+    `#graphql
+    mutation ArchiveOrder($input: OrderCloseInput!) {
+      orderClose(input: $input) {
+        order { id closedAt }
+        userErrors { field message }
+      }
+    }`,
+    { variables: { input: { id: orderGid } } },
+  );
+  const json = await response.json();
+  const errors = json?.data?.orderClose?.userErrors;
+  if (errors?.length) {
+    throw new Error(errors[0].message || "Could not archive the order");
+  }
+  if (!json?.data?.orderClose?.order) {
+    throw new Error(firstGraphqlMessage(json) || "Could not archive the order");
+  }
+}
+
 export type CustomerOrderGate = {
   id: string;
   name: string;
@@ -719,7 +829,7 @@ const QUEUE_TABS: Record<
     pages: 8,
   },
   done: {
-    statuses: ["shipped"],
+    statuses: ["shipped", "delivered"],
     query: "-status:cancelled fulfillment_status:fulfilled",
     reverse: true,
     pages: 2,
@@ -819,6 +929,7 @@ export async function listShopifyOrdersForSupplier(
     order_placed: 2,
     portrait_review: 3,
     shipped: 4,
+    delivered: 5,
   };
   return rows.sort((a, b) => {
     const diff = (priority[a.businessStatus] ?? 9) - (priority[b.businessStatus] ?? 9);

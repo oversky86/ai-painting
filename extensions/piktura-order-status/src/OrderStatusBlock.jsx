@@ -9,7 +9,11 @@ export default async () => {
 const ACCOUNT_WEB_URL = "https://orders.viewbrush.com";
 
 function publicShopKey(shopDomain) {
-  const host = String(shopDomain || "").trim().toLowerCase().replace(/^https?:\/\//, "").split("/")[0];
+  const host = String(shopDomain || "")
+    .trim()
+    .toLowerCase()
+    .replace(/^https?:\/\//, "")
+    .split("/")[0];
   if (!host) return undefined;
   if (
     host === "6hcr01-9t.myshopify.com" ||
@@ -19,7 +23,13 @@ function publicShopKey(shopDomain) {
   ) {
     return "prod";
   }
-  return "dev";
+  if (host === "e-commerce-dev-v6yidmlw.myshopify.com") return "dev";
+  return undefined;
+}
+
+function currentShopDomain() {
+  const shop = shopify.shop?.value || shopify.shop || {};
+  return shop.myshopifyDomain || shop.storefrontUrl || "";
 }
 
 function reviewHref(orderId, shopDomain) {
@@ -27,18 +37,14 @@ function reviewHref(orderId, shopDomain) {
   const numeric = String(orderId).replace(/\D/g, "") || orderId;
   const url = new URL(`${ACCOUNT_WEB_URL}/orders`);
   url.searchParams.set("review", String(orderId));
-  const shopKey = publicShopKey(shopDomain);
-  if (shopKey) url.searchParams.set("shop", shopKey);
+  url.searchParams.set("shop", publicShopKey(shopDomain) || "prod");
   url.hash = numeric;
   return url.toString();
 }
 
 function Extension() {
   const orderId = shopify.order?.value?.id;
-  const shopDomain =
-    shopify.shop?.myshopifyDomain ||
-    shopify.shop?.value?.myshopifyDomain ||
-    undefined;
+  const shopDomain = currentShopDomain();
   const href = reviewHref(orderId, shopDomain);
 
   return (

@@ -615,6 +615,124 @@ export async function recordLoginFailure(ip: string): Promise<{
   return { failCount, lockedUntil };
 }
 
+export type StatusEventActor = "customer" | "supplier" | "system";
+
+export type OrderStatusEventRow = {
+  id: string;
+  shop: string;
+  shopify_order_id: string;
+  from_status: string | null;
+  to_status: string;
+  actor: StatusEventActor;
+  occurred_at: string;
+  portrait_version_id: string | null;
+  modification_request_id: string | null;
+  detail: Record<string, unknown>;
+};
+
+export async function insertOrderStatusEvent(input: {
+  shop: string;
+  shopifyOrderId: string;
+  fromStatus: string | null;
+  toStatus: string;
+  actor: StatusEventActor;
+  occurredAt?: string;
+  portraitVersionId?: string | null;
+  modificationRequestId?: string | null;
+  detail?: Record<string, unknown>;
+}): Promise<OrderStatusEventRow> {
+  const row = {
+    id: newId("se"),
+    shop: input.shop,
+    shopify_order_id: input.shopifyOrderId,
+    from_status: input.fromStatus,
+    to_status: input.toStatus,
+    actor: input.actor,
+    occurred_at: input.occurredAt || new Date().toISOString(),
+    portrait_version_id: input.portraitVersionId || null,
+    modification_request_id: input.modificationRequestId || null,
+    detail: input.detail || {},
+  };
+  const { data, error } = await getClient()
+    .from("order_status_events")
+    .insert(row)
+    .select("*")
+    .single();
+  if (error) throw new Error(error.message);
+  return data as OrderStatusEventRow;
+}
+
+export async function deleteOrderStatusEvent(id: string): Promise<void> {
+  const { error } = await getClient().from("order_status_events").delete().eq("id", id);
+  if (error) console.error("[supplier-store] delete status event failed", id, error.message);
+}
+
+export async function listOrderStatusEvents(
+  shop: string,
+  shopifyOrderId: string,
+): Promise<OrderStatusEventRow[]> {
+  const byOrder = await listOrderStatusEventsForOrders(shop, [shopifyOrderId]);
+  return byOrder.get(shopifyOrderId) || [];
+}
+
+export async function listOrderStatusEventsForOrders(
+  shop: string,
+  shopifyOrderIds: string[],
+): Promise<Map<string, OrderStatusEventRow[]>> {
+  const byOrder = new Map<string, OrderStatusEventRow[]>();
+  if (!shopifyOrderIds.length) return byOrder;
+  const { data, error } = await getClient()
+    .from("order_status_events")
+    .select("*")
+    .eq("shop", shop)
+    .in("shopify_order_id", shopifyOrderIds)
+    .order("occurred_at", { ascending: true });
+  if (error) throw new Error(error.message);
+  for (const row of (data || []) as OrderStatusEventRow[]) {
+    const list = byOrder.get(row.shopify_order_id) || [];
+    list.push(row);
+    byOrder.set(row.shopify_order_id, list);
+  }
+  return byOrder;
+}
+
+/**
+ * Old orders have no trail. Record the placement, and the current status when
+ * it is later, without inventing the steps in between.
+ */
+export async function ensureStatusTrail(input: {
+  shop: string;
+  shopifyOrderId: string;
+  placedAt: string;
+  updatedAt?: string | null;
+  currentStatus: string;
+}): Promise<OrderStatusEventRow[]> {
+  const existing = await listOrderStatusEvents(input.shop, input.shopifyOrderId);
+  if (existing.length) return existing;
+  const placedAt = input.placedAt || new Date().toISOString();
+  await insertOrderStatusEvent({
+    shop: input.shop,
+    shopifyOrderId: input.shopifyOrderId,
+    fromStatus: null,
+    toStatus: "order_placed",
+    actor: "system",
+    occurredAt: placedAt,
+    detail: { backfill: true },
+  });
+  if (input.currentStatus !== "order_placed") {
+    await insertOrderStatusEvent({
+      shop: input.shop,
+      shopifyOrderId: input.shopifyOrderId,
+      fromStatus: null,
+      toStatus: input.currentStatus,
+      actor: "system",
+      occurredAt: input.updatedAt || placedAt,
+      detail: { backfill: true, gap: true },
+    });
+  }
+  return listOrderStatusEvents(input.shop, input.shopifyOrderId);
+}
+
 export async function clearLoginFailures(ip: string): Promise<void> {
   const sb = getClient();
   await sb.from("supplier_login_attempts").delete().eq("ip", ip);

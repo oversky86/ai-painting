@@ -7,8 +7,11 @@ import {
   resolveAllowedShop,
 } from "../utils/hmac-auth.server";
 import {
+  archiveShopifyOrder,
   createOrderFulfillment,
   effectiveBusinessStatus,
+  isTrackingCompany,
+  markOrderDelivered,
   enableBusinessStatusCustomerRead,
   fetchOrderDetailForSupplier,
   fetchOrderGate,
@@ -23,8 +26,11 @@ import {
   deletePortraitVersion,
   uploadExtensionForContentType,
   deleteStalePortraitRows,
+  ensureStatusTrail,
   getSupplierOrder,
+  getSupplierOrders,
   insertPortraitVersion,
+  listOrderStatusEventsForOrders,
   isValidUploadPath,
   loadOrderPortraitProgress,
   loadPortraitProgress,
@@ -33,6 +39,17 @@ import {
   upsertSupplierOrder,
 } from "../utils/supplier-store.server";
 import { runTransition, TransitionAbort } from "../utils/status-transition.server";
+
+function statusEnteredAt(
+  events: Array<{ to_status: string; occurred_at: string }>,
+  status: string,
+  placedAt?: string | null,
+): string | null {
+  const match = [...events].reverse().find((event) => event.to_status === status);
+  if (match) return match.occurred_at;
+  if (status === "order_placed" && placedAt) return placedAt;
+  return null;
+}
 
 function json(data: unknown, status = 200) {
   return Response.json(data, { status });
@@ -112,10 +129,33 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     const tab = (body.tab as "action" | "waiting" | "done") || "action";
     try {
       const rows = await listShopifyOrdersForSupplier(admin, tab);
+      const ids = rows.map((row) => row.id);
       const progress = await loadPortraitProgress(
         shop,
         rows.map((row) => ({ shopifyOrderId: row.id, businessStatus: row.businessStatus })),
       );
+      const trails = await listOrderStatusEventsForOrders(shop, ids).catch((err) => {
+        console.error("[supplier-api] status trail skipped", err);
+        return new Map();
+      });
+      const missing = rows.filter((row) => !(trails.get(row.id)?.length));
+      if (missing.length) {
+        const indexes = await getSupplierOrders(shop, missing.map((row) => row.id)).catch(() => []);
+        for (const row of missing) {
+          const index = indexes.find((item) => item.shopify_order_id === row.id);
+          const trail = await ensureStatusTrail({
+            shop,
+            shopifyOrderId: row.id,
+            placedAt: index?.placed_at || row.placedAt,
+            updatedAt: index?.updated_at,
+            currentStatus: row.businessStatus,
+          }).catch((err) => {
+            console.error("[supplier-api] status trail backfill skipped", row.id, err);
+            return [];
+          });
+          if (trail.length) trails.set(row.id, trail);
+        }
+      }
       return json({
         ok: true,
         tab,
@@ -131,6 +171,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
             modificationCount: p?.modificationCount ?? 0,
             latestNoteCount: latestRequest?.notes.length ?? 0,
             placedAt: row.placedAt,
+            statusEnteredAt: statusEnteredAt(trails.get(row.id) || [], row.businessStatus, row.placedAt),
             trackingCompany: row.trackingCompany,
             trackingNumber: row.trackingNumber,
             paintingUrl: row.paintingUrl,
@@ -198,6 +239,16 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     await reconcileSupplierOrder(index, businessStatus);
 
     const progress = await loadOrderPortraitProgress(shop, shopifyOrderId, businessStatus);
+    const trail = await ensureStatusTrail({
+      shop,
+      shopifyOrderId,
+      placedAt: index.placed_at || shopifyOrder.createdAt,
+      updatedAt: index.updated_at,
+      currentStatus: businessStatus,
+    }).catch((err) => {
+      console.error("[supplier-api] status trail skipped", shopifyOrderId, err);
+      return [];
+    });
     const tracking = trackingFromFulfillments(shopifyOrder.fulfillments);
     const urls = await signedReadUrls(
       progress.versions.flatMap((v) => [v.image_path, v.video_path || ""]),
@@ -235,6 +286,31 @@ export const action = async ({ request }: ActionFunctionArgs) => {
         nextVersion: progress.nextVersion,
         trackingCompany: tracking.company,
         trackingNumber: tracking.number,
+        statusEnteredAt: statusEnteredAt(trail, businessStatus, shopifyOrder.createdAt),
+        events: trail.map((event) => {
+          const version = progress.versions.find((item) => item.id === event.portrait_version_id);
+          const request = progress.requests.find((item) => item.id === event.modification_request_id);
+          const detail = event.detail || {};
+          return {
+            id: event.id,
+            fromStatus: event.from_status,
+            toStatus: event.to_status,
+            actor: event.actor,
+            occurredAt: event.occurred_at,
+            versionNumber:
+              version?.version_number ??
+              (typeof detail.versionNumber === "number" ? detail.versionNumber : null) ??
+              request?.against_version ??
+              null,
+            noteCount:
+              request?.notes.length ??
+              (typeof detail.noteCount === "number" ? detail.noteCount : null),
+            trackingCompany: typeof detail.trackingCompany === "string" ? detail.trackingCompany : null,
+            trackingNumber: typeof detail.trackingNumber === "string" ? detail.trackingNumber : null,
+            imageUrl: version ? urls.get(version.image_path) || null : null,
+            gap: detail.gap === true,
+          };
+        }),
         versions: progress.versions.map((v) => ({
           versionNumber: v.version_number,
           imageUrl: urls.get(v.image_path) || null,
@@ -341,6 +417,11 @@ export const action = async ({ request }: ActionFunctionArgs) => {
         });
       },
       undo: (version) => deletePortraitVersion(version.id),
+      record: (version) => ({
+        actor: "supplier",
+        portraitVersionId: version.id,
+        detail: { versionNumber: version.version_number },
+      }),
     });
     if (!outcome.ok) return json({ ok: false, error: outcome.error }, outcome.status);
 
@@ -359,6 +440,9 @@ export const action = async ({ request }: ActionFunctionArgs) => {
         { ok: false, error: "trackingCompany and trackingNumber required" },
         400,
       );
+    }
+    if (!isTrackingCompany(company)) {
+      return json({ ok: false, error: "trackingCompany must be UPS or FedEx" }, 400);
     }
 
     const gate = await loadWritableGate();
@@ -388,6 +472,10 @@ export const action = async ({ request }: ActionFunctionArgs) => {
           );
         }
       },
+      record: () => ({
+        actor: "supplier",
+        detail: { trackingCompany: company, trackingNumber: number },
+      }),
     });
     if (!outcome.ok) return json({ ok: false, error: outcome.error }, outcome.status);
 
@@ -397,6 +485,58 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       trackingCompany: company,
       trackingNumber: number,
     });
+  }
+
+  if (actionType === "deliver") {
+    const gate = await loadWritableGate();
+    if (gate instanceof Response) return gate;
+    if (gate.businessStatus !== "shipped" && gate.businessStatus !== "delivered") {
+      return json({ ok: false, error: "Only a shipped order can be marked delivered." }, 409);
+    }
+
+    try {
+      await markOrderDelivered(admin, ownerId);
+    } catch (err) {
+      return json(
+        { ok: false, error: err instanceof Error ? err.message : "Could not mark the shipment delivered" },
+        422,
+      );
+    }
+
+    let index = await loadIndex(gate);
+    if (gate.businessStatus === "shipped") {
+      const delivered = await runTransition({
+        admin,
+        ownerId,
+        index,
+        current: "shipped",
+        next: "delivered",
+        record: () => ({ actor: "supplier" }),
+      });
+      if (!delivered.ok) return json({ ok: false, error: delivered.error }, delivered.status);
+      index = delivered.row;
+    }
+
+    try {
+      await archiveShopifyOrder(admin, ownerId);
+    } catch (err) {
+      return json(
+        { ok: false, error: err instanceof Error ? err.message : "Could not archive the order" },
+        422,
+      );
+    }
+
+    const archived = await runTransition({
+      admin,
+      ownerId,
+      index,
+      current: "delivered",
+      next: "archived",
+      record: () => ({ actor: "supplier" }),
+    });
+    if (!archived.ok) return json({ ok: false, error: archived.error }, archived.status);
+
+    return json({ ok: true, businessStatus: "archived" });
   }
 
   return json({ ok: false, error: `Unknown action: ${actionType}` }, 400);

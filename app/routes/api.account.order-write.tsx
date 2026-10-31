@@ -301,6 +301,10 @@ export const action = async ({ request }: ActionFunctionArgs) => {
         index,
         current,
         next: "prepare_shipment",
+        record: () => ({
+          actor: "customer",
+          detail: { versionNumber: versionCount },
+        }),
       });
       if (!outcome.ok) return json({ ok: false, error: outcome.error }, outcome.status);
       return json({ ok: true, businessStatus: "prepare_shipment", orderId: ownerId });
@@ -327,6 +331,14 @@ export const action = async ({ request }: ActionFunctionArgs) => {
         });
       },
       undo: (created) => deleteModificationRequest(created.request.id),
+      record: (created) => ({
+        actor: "customer",
+        modificationRequestId: created.request.id,
+        detail: {
+          againstVersion: versionCount,
+          noteCount: created.notes.length,
+        },
+      }),
     });
     if (!outcome.ok) return json({ ok: false, error: outcome.error }, outcome.status);
 
