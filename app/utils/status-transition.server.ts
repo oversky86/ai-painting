@@ -94,7 +94,15 @@ export async function runTransition<T = undefined>(input: {
   }
 
   try {
-    await setOrderBusinessStatus(admin, index.shop, ownerId, next);
+    await setOrderBusinessStatus(
+      admin,
+      index.shop,
+      ownerId,
+      next,
+      next === "portrait_review" && input.bundle.portrait
+        ? String(input.bundle.portrait.versionNumber)
+        : null,
+    );
   } catch (err) {
     console.error("[transition] metafield write failed", ownerId, next, err);
     const landed = await getOrderBusinessStatus(admin, ownerId).catch(() => null);

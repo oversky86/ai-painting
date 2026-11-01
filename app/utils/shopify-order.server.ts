@@ -374,11 +374,84 @@ export async function ensureReviewLinkDefinition(
   }
 }
 
+const portraitVersionReady = new Set<string>();
+
+/** Lets Flow read the version that started this review. A definition problem must not block the status write. */
+export async function ensurePortraitVersionDefinition(
+  admin: AdminClient,
+  shop: string,
+): Promise<void> {
+  if (portraitVersionReady.has(shop)) return;
+  try {
+    const found = await admin.graphql(
+      `#graphql
+      query FindPortraitVersionDef {
+        metafieldDefinitions(
+          first: 1
+          ownerType: ORDER
+          namespace: "custom"
+          key: "portrait_version"
+        ) {
+          nodes { id }
+        }
+      }`,
+    );
+    const foundJson = await found.json();
+    const foundError = firstGraphqlMessage(foundJson);
+    if (foundError) throw new Error(foundError);
+    if (foundJson?.data?.metafieldDefinitions?.nodes?.[0]?.id) {
+      portraitVersionReady.add(shop);
+      return;
+    }
+
+    const create = (access?: { storefront: "NONE"; customerAccount: "NONE" }) =>
+      admin.graphql(
+        `#graphql
+        mutation CreatePortraitVersion($definition: MetafieldDefinitionInput!) {
+          metafieldDefinitionCreate(definition: $definition) {
+            createdDefinition { id }
+            userErrors { message code }
+          }
+        }`,
+        {
+          variables: {
+            definition: {
+              name: "Portrait version",
+              namespace: "custom",
+              key: "portrait_version",
+              description: "Portrait version submitted for the current review",
+              type: "single_line_text_field",
+              ownerType: "ORDER",
+              ...(access ? { access } : {}),
+            },
+          },
+        },
+      );
+
+    let createdJson = await (await create({ storefront: "NONE", customerAccount: "NONE" })).json();
+    let createErrors = createdJson?.data?.metafieldDefinitionCreate?.userErrors || [];
+    if (firstGraphqlMessage(createdJson) || createErrors.length) {
+      createdJson = await (await create()).json();
+      createErrors = createdJson?.data?.metafieldDefinitionCreate?.userErrors || [];
+    }
+    const duplicate = createErrors.some(
+      (error: { code?: string }) => error.code === "TAKEN" || error.code === "DUPLICATE",
+    );
+    if (createErrors.length && !duplicate && !firstGraphqlMessage(createdJson)) {
+      throw new Error(createErrors[0].message || "Could not create portrait_version");
+    }
+    portraitVersionReady.add(shop);
+  } catch (err) {
+    console.error("[shopify-order] portrait_version definition skipped", shop, err);
+  }
+}
+
 async function writeOrderBusinessStatus(
   admin: AdminClient,
   orderGid: string,
   status: BusinessStatus,
   reviewLink: string | null,
+  portraitVersion: string | null,
 ): Promise<void> {
   const metafields = [
     {
@@ -396,6 +469,17 @@ async function writeOrderBusinessStatus(
             key: "review_link",
             type: "single_line_text_field",
             value: reviewLink,
+          },
+        ]
+      : []),
+    ...(portraitVersion
+      ? [
+          {
+            ownerId: orderGid,
+            namespace: "custom",
+            key: "portrait_version",
+            type: "single_line_text_field",
+            value: portraitVersion,
           },
         ]
       : []),
@@ -509,6 +593,7 @@ export async function setOrderBusinessStatus(
   shop: string,
   orderGid: string,
   status: BusinessStatus,
+  portraitVersion: string | null = null,
 ): Promise<void> {
   const { orderReviewLinkValue } = await import("./order-link.server");
   let reviewLink: string | null = null;
@@ -518,11 +603,14 @@ export async function setOrderBusinessStatus(
     console.error("[shopify-order] review link skipped", orderGid, err);
   }
   if (reviewLink) await ensureReviewLinkDefinition(admin, shop);
+  if (portraitVersion) await ensurePortraitVersionDefinition(admin, shop);
   await ensureBusinessStatusChoices(admin, shop).catch((err) => {
     console.error("[shopify-order] business status choices skipped", shop, err);
   });
+  const write = (link: string | null) =>
+    writeOrderBusinessStatus(admin, orderGid, status, link, portraitVersion);
   try {
-    await writeOrderBusinessStatus(admin, orderGid, status, reviewLink);
+    await write(reviewLink);
   } catch (err) {
     const message = err instanceof Error ? err.message : "";
     if (isMissingStatusChoiceError(message)) {
@@ -530,14 +618,14 @@ export async function setOrderBusinessStatus(
       const expanded = await ensureBusinessStatusChoices(admin, shop);
       if (!expanded.ok) throw err;
       try {
-        await writeOrderBusinessStatus(admin, orderGid, status, reviewLink);
+        await write(reviewLink);
         return;
       } catch (retryErr) {
         if (!reviewLink) throw retryErr;
         const retryMessage = retryErr instanceof Error ? retryErr.message : "";
         if (isMissingStatusChoiceError(retryMessage)) throw retryErr;
         console.error("[shopify-order] review link write skipped", orderGid, retryErr);
-        await writeOrderBusinessStatus(admin, orderGid, status, null);
+        await write(null);
         return;
       }
     }
@@ -545,18 +633,18 @@ export async function setOrderBusinessStatus(
       const relaxed = await ensureBusinessStatusRepeatable(admin);
       if (!relaxed.ok) throw err;
       try {
-        await writeOrderBusinessStatus(admin, orderGid, status, reviewLink);
+        await write(reviewLink);
         return;
       } catch (retryErr) {
         if (!reviewLink) throw retryErr;
         console.error("[shopify-order] review link write skipped", orderGid, retryErr);
-        await writeOrderBusinessStatus(admin, orderGid, status, null);
+        await write(null);
         return;
       }
     }
     if (!reviewLink) throw err;
     console.error("[shopify-order] review link write skipped", orderGid, err);
-    await writeOrderBusinessStatus(admin, orderGid, status, null);
+    await write(null);
   }
 }
 
