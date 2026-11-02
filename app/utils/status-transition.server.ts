@@ -102,6 +102,7 @@ export async function runTransition<T = undefined>(input: {
       next === "portrait_review" && input.bundle.portrait
         ? String(input.bundle.portrait.versionNumber)
         : null,
+      current,
     );
   } catch (err) {
     console.error("[transition] metafield write failed", ownerId, next, err);

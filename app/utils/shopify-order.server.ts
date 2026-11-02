@@ -446,12 +446,149 @@ export async function ensurePortraitVersionDefinition(
   }
 }
 
+const REVIEW_WAITING_TAG = "review-waiting";
+const reviewScheduleReady = new Set<string>();
+
+/**
+ * Scheduled Flow for portrait review reminders. Do not use Wait.
+ *
+ * One workflow per store, trigger Scheduled time, shortest repeat the admin allows.
+ * Get order data with query `tag:review-waiting`. For each order:
+ * - Continue only when custom.business_status is portrait_review and custom.review_due_at is past.
+ * - If custom.review_sent_count is below 3, send the transactional email using custom.review_link,
+ *   then set review_sent_count to Run code nextCount and review_due_at to
+ *   `{{ scheduledAt | date_plus: "1 day" }}`. Keep those updates in the same run, with no Wait
+ *   before them, so the Run code output stays selectable.
+ * - If custom.review_sent_count is already 3, Cancel order with Refund off, Reason Other,
+ *   notifyCustomer off, and remove the review-waiting tag.
+ * The first review email stays on the existing business_status workflow.
+ */
+async function ensureReviewScheduleDefinitions(
+  admin: AdminClient,
+  shop: string,
+): Promise<void> {
+  if (reviewScheduleReady.has(shop)) return;
+  const fields = [
+    {
+      key: "review_due_at",
+      name: "Review due at",
+      type: "date_time",
+      description: "When the next portrait review reminder may be sent",
+    },
+    {
+      key: "review_sent_count",
+      name: "Review sent count",
+      type: "single_line_text_field",
+      description: "How many portrait review reminders have been sent for this round",
+    },
+  ];
+  try {
+    for (const field of fields) {
+      const found = await admin.graphql(
+        `#graphql
+        query FindReviewScheduleDef($key: String!) {
+          metafieldDefinitions(
+            first: 1
+            ownerType: ORDER
+            namespace: "custom"
+            key: $key
+          ) {
+            nodes { id }
+          }
+        }`,
+        { variables: { key: field.key } },
+      );
+      const foundJson = await found.json();
+      const foundError = firstGraphqlMessage(foundJson);
+      if (foundError) throw new Error(foundError);
+      if (foundJson?.data?.metafieldDefinitions?.nodes?.[0]?.id) continue;
+
+      const create = (access?: { storefront: "NONE"; customerAccount: "NONE" }) =>
+        admin.graphql(
+          `#graphql
+          mutation CreateReviewScheduleDef($definition: MetafieldDefinitionInput!) {
+            metafieldDefinitionCreate(definition: $definition) {
+              createdDefinition { id }
+              userErrors { message code }
+            }
+          }`,
+          {
+            variables: {
+              definition: {
+                name: field.name,
+                namespace: "custom",
+                key: field.key,
+                description: field.description,
+                type: field.type,
+                ownerType: "ORDER",
+                ...(access ? { access } : {}),
+              },
+            },
+          },
+        );
+      let createdJson = await (await create({ storefront: "NONE", customerAccount: "NONE" })).json();
+      let createErrors = createdJson?.data?.metafieldDefinitionCreate?.userErrors || [];
+      if (firstGraphqlMessage(createdJson) || createErrors.length) {
+        createdJson = await (await create()).json();
+        createErrors = createdJson?.data?.metafieldDefinitionCreate?.userErrors || [];
+      }
+      const duplicate = createErrors.some(
+        (error: { code?: string }) => error.code === "TAKEN" || error.code === "DUPLICATE",
+      );
+      if (createErrors.length && !duplicate && !firstGraphqlMessage(createdJson)) {
+        throw new Error(createErrors[0].message || `Could not create ${field.key}`);
+      }
+    }
+    reviewScheduleReady.add(shop);
+  } catch (err) {
+    console.error("[shopify-order] review schedule definition skipped", shop, err);
+  }
+}
+
+function reviewDueAt(): string {
+  return new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
+}
+
+async function setReviewWaitingTag(
+  admin: AdminClient,
+  orderGid: string,
+  active: boolean,
+): Promise<void> {
+  const mutation = active ? "tagsAdd" : "tagsRemove";
+  try {
+    if (active) {
+      await admin.graphql(
+        `#graphql
+        mutation ClearReviewWaiting($id: ID!, $tags: [String!]!) {
+          tagsRemove(id: $id, tags: $tags) { userErrors { message } }
+        }`,
+        { variables: { id: orderGid, tags: [REVIEW_WAITING_TAG] } },
+      );
+    }
+    const response = await admin.graphql(
+      `#graphql
+      mutation SetReviewWaiting($id: ID!, $tags: [String!]!) {
+        ${mutation}(id: $id, tags: $tags) { userErrors { message } }
+      }`,
+      { variables: { id: orderGid, tags: [REVIEW_WAITING_TAG] } },
+    );
+    const json = await response.json();
+    const errors = json?.data?.[mutation]?.userErrors;
+    if (errors?.length) {
+      console.error("[shopify-order] review-waiting tag skipped", orderGid, errors[0].message);
+    }
+  } catch (err) {
+    console.error("[shopify-order] review-waiting tag skipped", orderGid, err);
+  }
+}
+
 async function writeOrderBusinessStatus(
   admin: AdminClient,
   orderGid: string,
   status: BusinessStatus,
   reviewLink: string | null,
   portraitVersion: string | null,
+  startReviewSchedule: boolean,
 ): Promise<void> {
   const metafields = [
     {
@@ -480,6 +617,24 @@ async function writeOrderBusinessStatus(
             key: "portrait_version",
             type: "single_line_text_field",
             value: portraitVersion,
+          },
+        ]
+      : []),
+    ...(startReviewSchedule
+      ? [
+          {
+            ownerId: orderGid,
+            namespace: "custom",
+            key: "review_due_at",
+            type: "date_time",
+            value: reviewDueAt(),
+          },
+          {
+            ownerId: orderGid,
+            namespace: "custom",
+            key: "review_sent_count",
+            type: "single_line_text_field",
+            value: "0",
           },
         ]
       : []),
@@ -594,6 +749,7 @@ export async function setOrderBusinessStatus(
   orderGid: string,
   status: BusinessStatus,
   portraitVersion: string | null = null,
+  previousStatus: BusinessStatus | null = null,
 ): Promise<void> {
   const { orderReviewLinkValue } = await import("./order-link.server");
   let reviewLink: string | null = null;
@@ -602,13 +758,16 @@ export async function setOrderBusinessStatus(
   } catch (err) {
     console.error("[shopify-order] review link skipped", orderGid, err);
   }
+  const startReviewSchedule = Boolean(portraitVersion);
+  const stopReviewSchedule = previousStatus === "portrait_review" && status !== "portrait_review";
   if (reviewLink) await ensureReviewLinkDefinition(admin, shop);
   if (portraitVersion) await ensurePortraitVersionDefinition(admin, shop);
+  if (startReviewSchedule) await ensureReviewScheduleDefinitions(admin, shop);
   await ensureBusinessStatusChoices(admin, shop).catch((err) => {
     console.error("[shopify-order] business status choices skipped", shop, err);
   });
   const write = (link: string | null) =>
-    writeOrderBusinessStatus(admin, orderGid, status, link, portraitVersion);
+    writeOrderBusinessStatus(admin, orderGid, status, link, portraitVersion, startReviewSchedule);
   try {
     await write(reviewLink);
   } catch (err) {
@@ -619,33 +778,32 @@ export async function setOrderBusinessStatus(
       if (!expanded.ok) throw err;
       try {
         await write(reviewLink);
-        return;
       } catch (retryErr) {
         if (!reviewLink) throw retryErr;
         const retryMessage = retryErr instanceof Error ? retryErr.message : "";
         if (isMissingStatusChoiceError(retryMessage)) throw retryErr;
         console.error("[shopify-order] review link write skipped", orderGid, retryErr);
         await write(null);
-        return;
       }
-    }
-    if (isUniqueMetafieldValueError(message)) {
+    } else if (isUniqueMetafieldValueError(message)) {
       const relaxed = await ensureBusinessStatusRepeatable(admin);
       if (!relaxed.ok) throw err;
       try {
         await write(reviewLink);
-        return;
       } catch (retryErr) {
         if (!reviewLink) throw retryErr;
         console.error("[shopify-order] review link write skipped", orderGid, retryErr);
         await write(null);
-        return;
       }
+    } else if (!reviewLink) {
+      throw err;
+    } else {
+      console.error("[shopify-order] review link write skipped", orderGid, err);
+      await write(null);
     }
-    if (!reviewLink) throw err;
-    console.error("[shopify-order] review link write skipped", orderGid, err);
-    await write(null);
   }
+  if (startReviewSchedule) await setReviewWaitingTag(admin, orderGid, true);
+  if (stopReviewSchedule) await setReviewWaitingTag(admin, orderGid, false);
 }
 
 export async function enableBusinessStatusCustomerRead(
