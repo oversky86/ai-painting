@@ -11,6 +11,7 @@ import {
   releaseDailyLimit,
   type RateLimitResult,
 } from "../utils/rate-limit";
+import { createPrivateImageUrl, privateStoragePathFromUrl } from "../utils/supabase.server";
 
 // Handle CORS preflight (OPTIONS)
 export function loader({ request }: LoaderFunctionArgs) {
@@ -78,7 +79,9 @@ export async function action({ request }: ActionFunctionArgs) {
     // Real Replicate mode: create prediction + async polling via job-status
     if (generate) {
       const { createPrediction } = await import("../utils/replicate.server");
-      const prediction = await createPrediction(photo_url, prompt);
+      const privatePath = privateStoragePathFromUrl(photo_url);
+      const processingUrl = privatePath ? await createPrivateImageUrl(privatePath) : photo_url;
+      const prediction = await createPrediction(processingUrl, prompt);
 
       await createJob({
         id: jobId,

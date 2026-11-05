@@ -1,6 +1,7 @@
 import type { ActionFunctionArgs, LoaderFunctionArgs } from "react-router";
 import { nanoid } from "nanoid";
-import { uploadOriginalPhoto } from "../utils/supabase.server";
+import { uploadOriginalPhoto, uploadPainting } from "../utils/supabase.server";
+import prisma from "../db.server";
 import { withCors, handleCorsPreflight } from "../utils/cors.server";
 import { verifyAppProxySignature, getShopFromProxy } from "../utils/app-proxy-verify";
 import {
@@ -38,6 +39,8 @@ export async function action({ request }: ActionFunctionArgs) {
     console.log("[upload] Received request, method:", request.method);
     const formData = await request.formData();
     const file = formData.get("photo") as File | null;
+    const purpose = String(formData.get("purpose") || "original");
+    const generationJobId = String(formData.get("job_id") || "");
 
     if (!file) {
       return withCors(Response.json({ error: "No photo provided" }, { status: 400 }), request);
@@ -68,14 +71,29 @@ export async function action({ request }: ActionFunctionArgs) {
     const jobId = nanoid();
 
     console.log("[upload] Uploading to Supabase Storage, shop:", shop, "jobId:", jobId);
-    const photoUrl = await uploadOriginalPhoto(buffer, shop, jobId);
+    let photoUrl: string;
+    if (purpose === "painting" && generationJobId) {
+      const job = await prisma.generationJob.findFirst({ where: { id: generationJobId, shop }, select: { id: true } });
+      if (!job) return withCors(Response.json({ error: "Generation job not found" }, { status: 404 }), request);
+      photoUrl = await uploadPainting(
+        buffer,
+        shop,
+        generationJobId,
+        request.headers.get("origin"),
+        `painting-sized-${nanoid(8)}.jpg`,
+      );
+    } else {
+      photoUrl = await uploadOriginalPhoto(buffer, shop, jobId, request.headers.get("origin"));
+    }
     console.log("[upload] Success:", photoUrl);
 
     return withCors(Response.json({ photo_url: photoUrl, job_id: jobId }), request);
-  } catch (error: any) {
-    console.error("[upload] Error:", error?.message || error, error?.stack || "");
+  } catch (error: unknown) {
+    const message = error instanceof Error ? error.message : String(error);
+    const stack = error instanceof Error ? error.stack : "";
+    console.error("[upload] Error:", message, stack || "");
     return withCors(
-      Response.json({ error: "Upload failed. Please try again.", detail: error?.message || "unknown" }, { status: 503 }),
+      Response.json({ error: "Upload failed. Please try again.", detail: message || "unknown" }, { status: 503 }),
       request
     );
   }

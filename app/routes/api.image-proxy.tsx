@@ -23,7 +23,8 @@ export async function loader({ request }: LoaderFunctionArgs) {
   try {
     const host = new URL(src).hostname;
     const allowed =
-      host.includes("supabase.co") ||
+      host === "supabase.co" ||
+      host.endsWith(".supabase.co") ||
       host.includes("shopify.com") ||
       host.includes("cdn.shopify.com") ||
       host.endsWith(".myshopify.com");

@@ -13,6 +13,7 @@ import {
   type BusinessStatus,
 } from "../utils/business-status.server";
 import { canonicalShop } from "../utils/shops.server";
+import prisma from "../db.server";
 
 export const action = async ({ request }: ActionFunctionArgs) => {
   const { topic, shop: rawShop, payload, admin } = await authenticate.webhook(request);
@@ -45,7 +46,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     }
 
     const customAttrs: Record<string, string> = {};
-    const attrKeys = ["original_photo_url", "painting_url", "style"] as const;
+    const attrKeys = ["original_photo_url", "painting_url", "style", "generation_job_id"] as const;
     const normalizePropName = (name: string) =>
       name.startsWith("_") ? name.slice(1) : name;
 
@@ -67,6 +68,13 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     const ownerId = `gid://shopify/Order/${shopifyOrderId}`;
     let businessStatus: BusinessStatus = "order_placed";
     let existingStatus: string | null = null;
+
+    if (customAttrs.generation_job_id) {
+      await prisma.generationJob.updateMany({
+        where: { id: customAttrs.generation_job_id, shop },
+        data: { shopifyOrderId },
+      });
+    }
 
     if (admin) {
       // Shopify can redeliver orders/create; never push an advanced order back to order_placed.

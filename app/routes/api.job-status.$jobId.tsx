@@ -74,7 +74,7 @@ export async function loader({ params, request }: LoaderFunctionArgs) {
 
       // Image transfer: Replicate output → memory download → Supabase Storage upload
       const imageBuffer = await downloadImage(outputUrl);
-      const paintingUrl = await uploadPainting(imageBuffer, job.shop, jobId);
+      const paintingUrl = await uploadPainting(imageBuffer, job.shop, jobId, request.headers.get("origin"));
 
       // Update job with result
       await updateJob(jobId, { status: "completed", resultUrl: paintingUrl });
