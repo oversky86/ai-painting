@@ -5,6 +5,7 @@ import { useAppBridge } from "@shopify/app-bridge-react";
 import { authenticate } from "../shopify.server";
 import { boundary } from "@shopify/shopify-app-react-router/server";
 import prisma from "../db.server";
+import { normalizeDailyPreviewLimit } from "../utils/rate-limit";
 import { STYLE_KEYS, STYLE_LABELS, type StyleKey } from "../utils/style-keys";
 import {
   effectiveStylePrompts,
@@ -20,14 +21,14 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
   try {
     const settings = await prisma.shopRateLimit.findUnique({ where: { shop } });
     return {
-      dailyLimitLoggedIn: settings?.dailyLimitLoggedIn ?? 5,
-      dailyLimitAnonymous: settings?.dailyLimitAnonymous ?? 3,
+      dailyLimitLoggedIn: normalizeDailyPreviewLimit(settings?.dailyLimitLoggedIn),
+      dailyLimitAnonymous: normalizeDailyPreviewLimit(settings?.dailyLimitAnonymous),
       stylePrompts: await effectiveStylePrompts(shop),
     };
   } catch {
     return {
-      dailyLimitLoggedIn: 5,
-      dailyLimitAnonymous: 3,
+      dailyLimitLoggedIn: 8,
+      dailyLimitAnonymous: 8,
       stylePrompts: await effectiveStylePrompts(shop),
     };
   }
@@ -41,8 +42,8 @@ export const action = async ({ request }: ActionFunctionArgs) => {
 
   try {
     if (intent === "limits") {
-      const dailyLimitLoggedIn = parseInt(formData.get("dailyLimitLoggedIn") as string) || 5;
-      const dailyLimitAnonymous = parseInt(formData.get("dailyLimitAnonymous") as string) || 3;
+      const dailyLimitLoggedIn = normalizeDailyPreviewLimit(formData.get("dailyLimitLoggedIn"));
+      const dailyLimitAnonymous = normalizeDailyPreviewLimit(formData.get("dailyLimitAnonymous"));
       await prisma.shopRateLimit.upsert({
         where: { shop },
         update: { dailyLimitLoggedIn, dailyLimitAnonymous },

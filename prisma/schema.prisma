@@ -85,8 +85,8 @@ model ShopStylePrompt {
 model ShopRateLimit {
   id                    Int      @id @default(autoincrement())
   shop                  String   @unique
-  dailyLimitLoggedIn    Int      @default(5)
-  dailyLimitAnonymous   Int      @default(3)
+  dailyLimitLoggedIn    Int      @default(8)
+  dailyLimitAnonymous   Int      @default(8)
   updatedAt             DateTime @updatedAt
 }
 

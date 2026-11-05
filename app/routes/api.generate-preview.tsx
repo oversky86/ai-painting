@@ -5,7 +5,12 @@ import { buildGenerationPrompt } from "../utils/prompts.server";
 import { loadStylePromptOverrides } from "../utils/style-prompts.server";
 import { withCors, handleCorsPreflight } from "../utils/cors.server";
 import { verifyAppProxySignature, getShopFromProxy } from "../utils/app-proxy-verify";
-import { checkDailyLimit } from "../utils/rate-limit";
+import {
+  checkDailyLimit,
+  DAILY_PREVIEW_LIMIT_ERROR,
+  releaseDailyLimit,
+  type RateLimitResult,
+} from "../utils/rate-limit";
 
 // Handle CORS preflight (OPTIONS)
 export function loader({ request }: LoaderFunctionArgs) {
@@ -29,15 +34,7 @@ export async function action({ request }: ActionFunctionArgs) {
     return withCors(Response.json({ error: "Unauthorized" }, { status: 401 }), request);
   }
 
-  // Daily rate limit check
-  const rateLimit = await checkDailyLimit(request);
-  if (!rateLimit.allowed) {
-    return withCors(Response.json(
-      { error: `Daily limit reached. You can generate ${rateLimit.limit} images per day. Try again tomorrow.` },
-      { status: 429, headers: { "X-RateLimit-Remaining": "0", "X-RateLimit-Limit": String(rateLimit.limit) } }
-    ), request);
-  }
-
+  let rateLimit: RateLimitResult | null = null;
   try {
     const { photo_url, style, keywords, generate } = await request.json();
 
@@ -45,6 +42,27 @@ export async function action({ request }: ActionFunctionArgs) {
       return withCors(Response.json(
         { error: "photo_url and style are required" },
         { status: 400 }
+      ), request);
+    }
+
+    rateLimit = await checkDailyLimit(request);
+    if (!rateLimit.allowed) {
+      return withCors(Response.json(
+        {
+          code: DAILY_PREVIEW_LIMIT_ERROR,
+          error: `Daily limit reached. You can generate ${rateLimit.limit} images per day. Try again tomorrow.`,
+          limit: rateLimit.limit,
+          remaining: 0,
+          resets_at: rateLimit.resetsAt,
+        },
+        {
+          status: 429,
+          headers: {
+            "X-RateLimit-Remaining": "0",
+            "X-RateLimit-Limit": String(rateLimit.limit),
+            "X-RateLimit-Reset": rateLimit.resetsAt,
+          },
+        }
       ), request);
     }
 
@@ -77,6 +95,8 @@ export async function action({ request }: ActionFunctionArgs) {
         job_id: jobId,
         status: "accepted",
         remaining: rateLimit.remaining,
+        limit: rateLimit.limit,
+        resets_at: rateLimit.resetsAt,
       }), request);
     }
 
@@ -96,9 +116,18 @@ export async function action({ request }: ActionFunctionArgs) {
       job_id: jobId,
       status: "accepted",
       remaining: rateLimit.remaining,
+      limit: rateLimit.limit,
+      resets_at: rateLimit.resetsAt,
     }), request);
   } catch (error) {
     console.error("Generate preview error:", error);
+    if (rateLimit?.allowed) {
+      try {
+        await releaseDailyLimit(rateLimit);
+      } catch (releaseError) {
+        console.error("[rate-limit] Failed to release generation reservation:", releaseError);
+      }
+    }
     return withCors(Response.json(
       { error: "AI service temporarily unavailable. Please try again." },
       { status: 503 }
