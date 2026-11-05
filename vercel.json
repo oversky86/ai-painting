@@ -2,12 +2,6 @@
   "buildCommand": "npx react-router build",
   "installCommand": "npm install && npx prisma generate",
   "framework": "react-router",
-  "crons": [
-    {
-      "path": "/api/privacy/cleanup",
-      "schedule": "17 3 * * *"
-    }
-  ],
   "env": {
     "NODE_ENV": "production"
   }
