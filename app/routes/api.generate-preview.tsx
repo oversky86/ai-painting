@@ -37,7 +37,7 @@ export async function action({ request }: ActionFunctionArgs) {
 
   let rateLimit: RateLimitResult | null = null;
   try {
-    const { photo_url, style, keywords, generate } = await request.json();
+    const { photo_url, style, keywords, generate, visitor_key } = await request.json();
 
     if (!photo_url || !style) {
       return withCors(Response.json(
@@ -46,7 +46,7 @@ export async function action({ request }: ActionFunctionArgs) {
       ), request);
     }
 
-    rateLimit = await checkDailyLimit(request);
+    rateLimit = await checkDailyLimit(request, visitor_key);
     if (!rateLimit.allowed) {
       return withCors(Response.json(
         {

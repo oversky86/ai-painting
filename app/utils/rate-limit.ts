@@ -36,12 +36,15 @@ function dailyWindow() {
   return { date, resetsAt: resetsAt.toISOString() };
 }
 
-export async function checkDailyLimit(request: Request): Promise<RateLimitResult> {
+export async function checkDailyLimit(request: Request, visitorKey?: string): Promise<RateLimitResult> {
   const shop = getShopFromProxy(request);
   const customerId = getCustomerIdFromProxy(request);
   const ip = request.headers.get("X-Forwarded-For")?.split(",")[0]?.trim() || "unknown";
   const window = dailyWindow();
-  const identity = customerId ? `customer:${customerId}` : `ip:${ip}`;
+  const normalizedVisitorKey = String(visitorKey || "").trim().replace(/^guest:/, "").slice(0, 128);
+  const identity = customerId
+    ? `customer:${customerId}`
+    : (normalizedVisitorKey ? `visitor:${normalizedVisitorKey}` : `ip:${ip}`);
   const key = `${shop}:${identity}`;
   const settings = await prisma.shopRateLimit.findUnique({ where: { shop } });
   const configuredLimit = settings
