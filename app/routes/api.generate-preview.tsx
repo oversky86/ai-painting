@@ -4,7 +4,7 @@ import { createJob } from "../utils/job-store.server";
 import { buildGenerationPrompt } from "../utils/prompts.server";
 import { loadStylePromptOverrides } from "../utils/style-prompts.server";
 import { withCors, handleCorsPreflight } from "../utils/cors.server";
-import { verifyAppProxySignature, getShopFromProxy } from "../utils/app-proxy-verify";
+import { verifyAppProxySignature, getShopFromProxy, getCustomerIdFromProxy } from "../utils/app-proxy-verify";
 import {
   checkDailyLimit,
   DAILY_PREVIEW_LIMIT_ERROR,
@@ -12,6 +12,27 @@ import {
   type RateLimitResult,
 } from "../utils/rate-limit";
 import { createPrivateImageUrl, privateStoragePathFromUrl } from "../utils/supabase.server";
+import prisma from "../db.server";
+
+const EMAIL_UNLOCK_REQUIRED = "EMAIL_REQUIRED_FOR_MORE_PREVIEWS";
+
+function validEmail(value: unknown): string {
+  const email = String(value || "").trim().slice(0, 320);
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) ? email : "";
+}
+
+async function emailUnlocked(request: Request, visitorKey: unknown, suppliedEmail: unknown): Promise<boolean> {
+  if (getCustomerIdFromProxy(request)) return true;
+  if (validEmail(suppliedEmail)) return true;
+  const shop = getShopFromProxy(request);
+  const guestId = String(visitorKey || "").trim().replace(/^guest:/, "").slice(0, 128);
+  if (!guestId) return false;
+  const session = await prisma.flowSession.findUnique({
+    where: { shop_visitorKey: { shop, visitorKey: `guest:${guestId}` } },
+    select: { email: true },
+  });
+  return Boolean(validEmail(session?.email));
+}
 
 // Handle CORS preflight (OPTIONS)
 export function loader({ request }: LoaderFunctionArgs) {
@@ -37,7 +58,7 @@ export async function action({ request }: ActionFunctionArgs) {
 
   let rateLimit: RateLimitResult | null = null;
   try {
-    const { photo_url, style, keywords, generate, visitor_key } = await request.json();
+    const { photo_url, style, keywords, generate, visitor_key, contact_email } = await request.json();
 
     if (!photo_url || !style) {
       return withCors(Response.json(
@@ -46,8 +67,17 @@ export async function action({ request }: ActionFunctionArgs) {
       ), request);
     }
 
-    rateLimit = await checkDailyLimit(request, visitor_key);
+    const unlocked = await emailUnlocked(request, visitor_key, contact_email);
+    rateLimit = await checkDailyLimit(request, visitor_key, unlocked ? 8 : 2);
     if (!rateLimit.allowed) {
+      if (!unlocked) {
+        return withCors(Response.json({
+          code: EMAIL_UNLOCK_REQUIRED,
+          error: "Enter your email to unlock 6 more previews today.",
+          limit: 2,
+          remaining: 0,
+        }, { status: 403 }), request);
+      }
       return withCors(Response.json(
         {
           code: DAILY_PREVIEW_LIMIT_ERROR,

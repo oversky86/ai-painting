@@ -36,7 +36,7 @@ function dailyWindow() {
   return { date, resetsAt: resetsAt.toISOString() };
 }
 
-export async function checkDailyLimit(request: Request, visitorKey?: string): Promise<RateLimitResult> {
+export async function checkDailyLimit(request: Request, visitorKey?: string, limitCap = MAX_DAILY_PREVIEW_LIMIT): Promise<RateLimitResult> {
   const shop = getShopFromProxy(request);
   const customerId = getCustomerIdFromProxy(request);
   const ip = request.headers.get("X-Forwarded-For")?.split(",")[0]?.trim() || "unknown";
@@ -52,7 +52,7 @@ export async function checkDailyLimit(request: Request, visitorKey?: string): Pr
         ? (settings.dailyLimitLoggedIn || DEFAULT_DAILY_LIMIT)
         : (settings.dailyLimitAnonymous || DEFAULT_DAILY_LIMIT))
     : DEFAULT_DAILY_LIMIT;
-  const limit = normalizeDailyPreviewLimit(configuredLimit);
+  const limit = Math.min(normalizeDailyPreviewLimit(configuredLimit), limitCap);
 
   // The conditional upsert reserves one generation without allowing concurrent
   // requests to push the counter past the configured daily limit.
