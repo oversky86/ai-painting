@@ -1,9 +1,8 @@
-import { type LoaderFunctionArgs } from "react-router";
-
-export function loader(_args: LoaderFunctionArgs) {
+export function loader() {
   return Response.json({
     status: "ok",
     time: new Date().toISOString(),
+    release: process.env.VERCEL_GIT_COMMIT_SHA?.slice(0, 7) || "local",
     env: {
       SHOPIFY_API_KEY: !!process.env.SHOPIFY_API_KEY,
       SHOPIFY_API_SECRET: !!process.env.SHOPIFY_API_SECRET,
