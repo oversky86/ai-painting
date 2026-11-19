@@ -68,12 +68,12 @@ export async function action({ request }: ActionFunctionArgs) {
     }
 
     const unlocked = await emailUnlocked(request, visitor_key, contact_email);
-    rateLimit = await checkDailyLimit(request, visitor_key, unlocked ? 8 : 2);
+    rateLimit = await checkDailyLimit(request, visitor_key, unlocked ? undefined : 2);
     if (!rateLimit.allowed) {
       if (!unlocked) {
         return withCors(Response.json({
           code: EMAIL_UNLOCK_REQUIRED,
-          error: "Enter your email to unlock 6 more previews today.",
+          error: "Enter your email to keep generating previews today.",
           limit: 2,
           remaining: 0,
         }, { status: 403 }), request);

@@ -7,8 +7,8 @@ import { Prisma } from "@prisma/client";
 import prisma from "../db.server";
 import { getCustomerIdFromProxy, getShopFromProxy } from "./app-proxy-verify";
 
-export const MAX_DAILY_PREVIEW_LIMIT = 8;
-export const DEFAULT_DAILY_LIMIT = MAX_DAILY_PREVIEW_LIMIT;
+export const DEFAULT_DAILY_LIMIT = 8;
+export const MAX_SAVED_DAILY_LIMIT = 1_000_000;
 export const DAILY_PREVIEW_LIMIT_ERROR = "DAILY_PREVIEW_LIMIT_REACHED";
 
 export interface RateLimitResult {
@@ -24,8 +24,8 @@ type UsageCount = { count: number };
 
 export function normalizeDailyPreviewLimit(value: unknown): number {
   const parsed = Number.parseInt(String(value ?? ""), 10);
-  if (!Number.isFinite(parsed) || parsed < 1) return DEFAULT_DAILY_LIMIT;
-  return Math.min(parsed, MAX_DAILY_PREVIEW_LIMIT);
+  if (!Number.isInteger(parsed) || parsed < 1) return DEFAULT_DAILY_LIMIT;
+  return Math.min(parsed, MAX_SAVED_DAILY_LIMIT);
 }
 
 function dailyWindow() {
@@ -36,7 +36,7 @@ function dailyWindow() {
   return { date, resetsAt: resetsAt.toISOString() };
 }
 
-export async function checkDailyLimit(request: Request, visitorKey?: string, limitCap = MAX_DAILY_PREVIEW_LIMIT): Promise<RateLimitResult> {
+export async function checkDailyLimit(request: Request, visitorKey?: string, limitCap?: number): Promise<RateLimitResult> {
   const shop = getShopFromProxy(request);
   const customerId = getCustomerIdFromProxy(request);
   const ip = request.headers.get("X-Forwarded-For")?.split(",")[0]?.trim() || "unknown";
@@ -52,7 +52,8 @@ export async function checkDailyLimit(request: Request, visitorKey?: string, lim
         ? (settings.dailyLimitLoggedIn || DEFAULT_DAILY_LIMIT)
         : (settings.dailyLimitAnonymous || DEFAULT_DAILY_LIMIT))
     : DEFAULT_DAILY_LIMIT;
-  const limit = Math.min(normalizeDailyPreviewLimit(configuredLimit), limitCap);
+  const shopLimit = normalizeDailyPreviewLimit(configuredLimit);
+  const limit = typeof limitCap === "number" ? Math.min(shopLimit, limitCap) : shopLimit;
 
   // The conditional upsert reserves one generation without allowing concurrent
   // requests to push the counter past the configured daily limit.

@@ -15,7 +15,7 @@ import {
 type SettingsIntent = "limits" | "prompts";
 
 const MIN_DAILY_LIMIT = 1;
-const MAX_DAILY_LIMIT = 8;
+const MAX_DAILY_LIMIT = 1_000_000;
 
 function parseSettingsLimit(value: FormDataEntryValue | null): number | null {
   if (typeof value !== "string" || !/^\d+$/.test(value.trim())) return null;
@@ -208,14 +208,13 @@ export default function Settings() {
                   type="number"
                   name="dailyLimitLoggedIn"
                   min={MIN_DAILY_LIMIT}
-                  max={MAX_DAILY_LIMIT}
                   step={1}
                   inputMode="numeric"
                   required
                   defaultValue={dailyLimitLoggedIn}
                   key={`logged-in-${dailyLimitLoggedIn}`}
                 />
-                <p>Whole number from 1 to 8. Logged-in buyers are counted by customer ID.</p>
+                <p>Any whole number of 1 or more. Logged-in buyers are counted by customer ID.</p>
               </div>
               <div className="daily-limit-field">
                 <label htmlFor="daily-limit-anonymous">Anonymous visitor daily limit</label>
@@ -224,14 +223,13 @@ export default function Settings() {
                   type="number"
                   name="dailyLimitAnonymous"
                   min={MIN_DAILY_LIMIT}
-                  max={MAX_DAILY_LIMIT}
                   step={1}
                   inputMode="numeric"
                   required
                   defaultValue={dailyLimitAnonymous}
                   key={`anonymous-${dailyLimitAnonymous}`}
                 />
-                <p>Whole number from 1 to 8. Anonymous buyers are counted by IP address.</p>
+                <p>Any whole number of 1 or more. Anonymous buyers are counted by IP address.</p>
               </div>
               <s-button
                 type="button"
@@ -342,7 +340,7 @@ export default function Settings() {
               <strong>Anonymous visitors</strong>: Limited by IP address
             </s-list-item>
             <s-list-item>Counter resets daily at UTC midnight</s-list-item>
-            <s-list-item>Each limit must be a whole number from 1 to 8</s-list-item>
+            <s-list-item>Each limit can be any whole number of 1 or more</s-list-item>
             <s-list-item>A shop with no saved limit uses 8 per day</s-list-item>
           </s-unordered-list>
         </s-section>
