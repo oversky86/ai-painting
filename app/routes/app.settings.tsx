@@ -14,6 +14,16 @@ import {
 
 type SettingsIntent = "limits" | "prompts";
 
+const MIN_DAILY_LIMIT = 1;
+const MAX_DAILY_LIMIT = 8;
+
+function parseSettingsLimit(value: FormDataEntryValue | null): number | null {
+  if (typeof value !== "string" || !/^\d+$/.test(value.trim())) return null;
+  const parsed = Number(value.trim());
+  if (!Number.isInteger(parsed) || parsed < MIN_DAILY_LIMIT || parsed > MAX_DAILY_LIMIT) return null;
+  return parsed;
+}
+
 export const loader = async ({ request }: LoaderFunctionArgs) => {
   const { session } = await authenticate.admin(request);
   const shop = session.shop;
@@ -43,8 +53,15 @@ export const action = async ({ request }: ActionFunctionArgs) => {
 
   try {
     if (intent === "limits") {
-      const dailyLimitLoggedIn = normalizeDailyPreviewLimit(formData.get("dailyLimitLoggedIn"));
-      const dailyLimitAnonymous = normalizeDailyPreviewLimit(formData.get("dailyLimitAnonymous"));
+      const dailyLimitLoggedIn = parseSettingsLimit(formData.get("dailyLimitLoggedIn"));
+      const dailyLimitAnonymous = parseSettingsLimit(formData.get("dailyLimitAnonymous"));
+      if (dailyLimitLoggedIn == null || dailyLimitAnonymous == null) {
+        return {
+          success: false,
+          intent: "limits" as const,
+          error: `Enter a whole number from ${MIN_DAILY_LIMIT} to ${MAX_DAILY_LIMIT} for each daily limit.`,
+        };
+      }
       const saved = await prisma.shopRateLimit.upsert({
         where: { shop },
         update: { dailyLimitLoggedIn, dailyLimitAnonymous },
@@ -80,16 +97,6 @@ export const action = async ({ request }: ActionFunctionArgs) => {
 const LIMITS_MODAL_ID = "save-limits-modal";
 const PROMPTS_MODAL_ID = "save-prompts-modal";
 
-type LimitFieldName = "dailyLimitLoggedIn" | "dailyLimitAnonymous";
-
-function readLimitField(form: HTMLFormElement, name: LimitFieldName): string {
-  const field = form.querySelector(`s-text-field[name="${name}"]`);
-  if (!(field instanceof HTMLElement)) return "";
-  const inner = field.shadowRoot?.querySelector("input");
-  if (inner instanceof HTMLInputElement) return inner.value.trim();
-  return "value" in field && typeof field.value === "string" ? field.value.trim() : "";
-}
-
 export default function Settings() {
   const data = useLoaderData<typeof loader>();
   const fetcher = useFetcher<typeof action>();
@@ -98,33 +105,7 @@ export default function Settings() {
   const promptsFormRef = useRef<HTMLFormElement>(null);
   const confirmedSaveRef = useRef(false);
   const saveLockedRef = useRef(false);
-  const limitDraftRef = useRef<Partial<Record<LimitFieldName, string>>>({});
   const [view, setView] = useState<SettingsIntent>("limits");
-
-  useEffect(() => {
-    const form = limitsFormRef.current;
-    if (!form) return;
-    // s-text-field keeps the value attribute as the initial value. Typed text lives
-    // on the inner input, and a later render can put the attribute back before submit.
-    const rememberTypedLimit = (event: Event) => {
-      const input = event.composedPath().find((node) => node instanceof HTMLInputElement);
-      if (!input) return;
-      const root = input.getRootNode();
-      const field = root instanceof ShadowRoot ? root.host : null;
-      if (!(field instanceof HTMLElement)) return;
-      const name = field.getAttribute("name");
-      if (name !== "dailyLimitLoggedIn" && name !== "dailyLimitAnonymous") return;
-      limitDraftRef.current[name] = input.value;
-    };
-    form.addEventListener("input", rememberTypedLimit, true);
-    return () => form.removeEventListener("input", rememberTypedLimit, true);
-  }, []);
-
-  useEffect(() => {
-    if (fetcher.state === "idle" && fetcher.data?.success && fetcher.data.intent === "limits") {
-      limitDraftRef.current = {};
-    }
-  }, [fetcher.state, fetcher.data]);
 
   const isSaving = fetcher.state === "submitting";
   const savedIntent = fetcher.data?.success ? fetcher.data.intent : undefined;
@@ -152,29 +133,11 @@ export default function Settings() {
 
   const confirmSave = (intent: SettingsIntent) => {
     if (isSaving || saveLockedRef.current) return;
-    if (intent === "limits") {
-      const form = limitsFormRef.current;
-      if (!form) return;
-      saveLockedRef.current = true;
-      shopify.modal.hide(LIMITS_MODAL_ID);
-      const formData = new FormData();
-      formData.set("intent", "limits");
-      formData.set(
-        "dailyLimitLoggedIn",
-        limitDraftRef.current.dailyLimitLoggedIn ?? readLimitField(form, "dailyLimitLoggedIn"),
-      );
-      formData.set(
-        "dailyLimitAnonymous",
-        limitDraftRef.current.dailyLimitAnonymous ?? readLimitField(form, "dailyLimitAnonymous"),
-      );
-      fetcher.submit(formData, { method: "post" });
-      return;
-    }
-    const form = promptsFormRef.current;
+    const form = intent === "limits" ? limitsFormRef.current : promptsFormRef.current;
     if (!form) return;
     saveLockedRef.current = true;
     confirmedSaveRef.current = true;
-    shopify.modal.hide(PROMPTS_MODAL_ID);
+    shopify.modal.hide(intent === "limits" ? LIMITS_MODAL_ID : PROMPTS_MODAL_ID);
     form.requestSubmit();
     if (confirmedSaveRef.current) {
       confirmedSaveRef.current = false;
@@ -193,6 +156,19 @@ export default function Settings() {
 
   return (
     <s-page heading="Generation settings">
+      <style>{`
+        .daily-limit-field { display: grid; gap: 6px; max-width: 28rem; }
+        .daily-limit-field label { font-weight: 550; }
+        .daily-limit-field input {
+          width: 8rem;
+          font: inherit;
+          padding: 8px 12px;
+          border: 1px solid #8a8a8a;
+          border-radius: 8px;
+          background: #fff;
+        }
+        .daily-limit-field p { margin: 0; color: #616161; }
+      `}</style>
       <s-button-group gap="none" accessibilityLabel="Generation settings">
         <s-button
           slot="secondary-actions"
@@ -225,18 +201,38 @@ export default function Settings() {
               These limits help control AI generation costs.
             </s-paragraph>
             <s-stack direction="block" gap="base">
-              <s-text-field
-                name="dailyLimitLoggedIn"
-                label="Logged-in customer daily limit"
-                value={String(dailyLimitLoggedIn)}
-                details="Maximum images per day for logged-in customers"
-              />
-              <s-text-field
-                name="dailyLimitAnonymous"
-                label="Anonymous visitor daily limit"
-                value={String(dailyLimitAnonymous)}
-                details="Maximum images per day for anonymous visitors (tracked by IP)"
-              />
+              <div className="daily-limit-field">
+                <label htmlFor="daily-limit-logged-in">Logged-in customer daily limit</label>
+                <input
+                  id="daily-limit-logged-in"
+                  type="number"
+                  name="dailyLimitLoggedIn"
+                  min={MIN_DAILY_LIMIT}
+                  max={MAX_DAILY_LIMIT}
+                  step={1}
+                  inputMode="numeric"
+                  required
+                  defaultValue={dailyLimitLoggedIn}
+                  key={`logged-in-${dailyLimitLoggedIn}`}
+                />
+                <p>Whole number from 1 to 8. Logged-in buyers are counted by customer ID.</p>
+              </div>
+              <div className="daily-limit-field">
+                <label htmlFor="daily-limit-anonymous">Anonymous visitor daily limit</label>
+                <input
+                  id="daily-limit-anonymous"
+                  type="number"
+                  name="dailyLimitAnonymous"
+                  min={MIN_DAILY_LIMIT}
+                  max={MAX_DAILY_LIMIT}
+                  step={1}
+                  inputMode="numeric"
+                  required
+                  defaultValue={dailyLimitAnonymous}
+                  key={`anonymous-${dailyLimitAnonymous}`}
+                />
+                <p>Whole number from 1 to 8. Anonymous buyers are counted by IP address.</p>
+              </div>
               <s-button
                 type="button"
                 onClick={() => openSaveConfirm("limits")}
@@ -346,9 +342,8 @@ export default function Settings() {
               <strong>Anonymous visitors</strong>: Limited by IP address
             </s-list-item>
             <s-list-item>Counter resets daily at UTC midnight</s-list-item>
-            <s-list-item>
-              If the database is unreachable, the default limit (10/day) is used
-            </s-list-item>
+            <s-list-item>Each limit must be a whole number from 1 to 8</s-list-item>
+            <s-list-item>A shop with no saved limit uses 8 per day</s-list-item>
           </s-unordered-list>
         </s-section>
       ) : (
