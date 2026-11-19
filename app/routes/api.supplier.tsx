@@ -7,7 +7,6 @@ import {
   resolveAllowedShop,
 } from "../utils/hmac-auth.server";
 import {
-  archiveShopifyOrder,
   createOrderFulfillment,
   effectiveBusinessStatus,
   isTrackingCompany,
@@ -484,55 +483,32 @@ export const action = async ({ request }: ActionFunctionArgs) => {
   if (actionType === "deliver") {
     const gate = await loadWritableGate();
     if (gate instanceof Response) return gate;
-    if (gate.businessStatus !== "shipped" && gate.businessStatus !== "delivered") {
+    if (gate.businessStatus !== "shipped") {
       return json({ ok: false, error: "Only a shipped order can be marked delivered." }, 409);
     }
 
-    let index = await loadIndex(gate);
-    if (gate.businessStatus === "shipped") {
-      const delivered = await runTransition({
-        admin,
-        ownerId,
-        index,
-        current: "shipped",
-        next: "delivered",
-        bundle: { actor: "supplier" },
-        apply: async () => {
-          try {
-            await markOrderDelivered(admin, ownerId);
-          } catch (err) {
-            throw new TransitionAbort(
-              422,
-              err instanceof Error ? err.message : "Could not mark the shipment delivered",
-            );
-          }
-        },
-      });
-      if (!delivered.ok) return json({ ok: false, error: delivered.error }, delivered.status);
-      index = delivered.row;
-    }
-
-    const archived = await runTransition({
+    const index = await loadIndex(gate);
+    const delivered = await runTransition({
       admin,
       ownerId,
       index,
-      current: "delivered",
-      next: "archived",
+      current: "shipped",
+      next: "delivered",
       bundle: { actor: "supplier" },
       apply: async () => {
         try {
-          await archiveShopifyOrder(admin, ownerId);
+          await markOrderDelivered(admin, ownerId);
         } catch (err) {
           throw new TransitionAbort(
             422,
-            err instanceof Error ? err.message : "Could not archive the order",
+            err instanceof Error ? err.message : "Could not mark the shipment delivered",
           );
         }
       },
     });
-    if (!archived.ok) return json({ ok: false, error: archived.error }, archived.status);
+    if (!delivered.ok) return json({ ok: false, error: delivered.error }, delivered.status);
 
-    return json({ ok: true, businessStatus: "archived" });
+    return json({ ok: true, businessStatus: "delivered" });
   }
 
   return json({ ok: false, error: `Unknown action: ${actionType}` }, 400);
