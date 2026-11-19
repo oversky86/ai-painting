@@ -25,7 +25,8 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
       dailyLimitAnonymous: normalizeDailyPreviewLimit(settings?.dailyLimitAnonymous),
       stylePrompts: await effectiveStylePrompts(shop),
     };
-  } catch {
+  } catch (error) {
+    console.error("[settings] Load failed:", error);
     return {
       dailyLimitLoggedIn: 8,
       dailyLimitAnonymous: 8,
@@ -44,12 +45,17 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     if (intent === "limits") {
       const dailyLimitLoggedIn = normalizeDailyPreviewLimit(formData.get("dailyLimitLoggedIn"));
       const dailyLimitAnonymous = normalizeDailyPreviewLimit(formData.get("dailyLimitAnonymous"));
-      await prisma.shopRateLimit.upsert({
+      const saved = await prisma.shopRateLimit.upsert({
         where: { shop },
         update: { dailyLimitLoggedIn, dailyLimitAnonymous },
         create: { shop, dailyLimitLoggedIn, dailyLimitAnonymous },
       });
-      return { success: true, intent, dailyLimitLoggedIn, dailyLimitAnonymous };
+      return {
+        success: true,
+        intent: "limits" as const,
+        dailyLimitLoggedIn: saved.dailyLimitLoggedIn,
+        dailyLimitAnonymous: saved.dailyLimitAnonymous,
+      };
     }
 
     if (intent === "prompts") {
@@ -74,6 +80,16 @@ export const action = async ({ request }: ActionFunctionArgs) => {
 const LIMITS_MODAL_ID = "save-limits-modal";
 const PROMPTS_MODAL_ID = "save-prompts-modal";
 
+type LimitFieldName = "dailyLimitLoggedIn" | "dailyLimitAnonymous";
+
+function readLimitField(form: HTMLFormElement, name: LimitFieldName): string {
+  const field = form.querySelector(`s-text-field[name="${name}"]`);
+  if (!(field instanceof HTMLElement)) return "";
+  const inner = field.shadowRoot?.querySelector("input");
+  if (inner instanceof HTMLInputElement) return inner.value.trim();
+  return "value" in field && typeof field.value === "string" ? field.value.trim() : "";
+}
+
 export default function Settings() {
   const data = useLoaderData<typeof loader>();
   const fetcher = useFetcher<typeof action>();
@@ -82,7 +98,33 @@ export default function Settings() {
   const promptsFormRef = useRef<HTMLFormElement>(null);
   const confirmedSaveRef = useRef(false);
   const saveLockedRef = useRef(false);
+  const limitDraftRef = useRef<Partial<Record<LimitFieldName, string>>>({});
   const [view, setView] = useState<SettingsIntent>("limits");
+
+  useEffect(() => {
+    const form = limitsFormRef.current;
+    if (!form) return;
+    // s-text-field keeps the value attribute as the initial value. Typed text lives
+    // on the inner input, and a later render can put the attribute back before submit.
+    const rememberTypedLimit = (event: Event) => {
+      const input = event.composedPath().find((node) => node instanceof HTMLInputElement);
+      if (!input) return;
+      const root = input.getRootNode();
+      const field = root instanceof ShadowRoot ? root.host : null;
+      if (!(field instanceof HTMLElement)) return;
+      const name = field.getAttribute("name");
+      if (name !== "dailyLimitLoggedIn" && name !== "dailyLimitAnonymous") return;
+      limitDraftRef.current[name] = input.value;
+    };
+    form.addEventListener("input", rememberTypedLimit, true);
+    return () => form.removeEventListener("input", rememberTypedLimit, true);
+  }, []);
+
+  useEffect(() => {
+    if (fetcher.state === "idle" && fetcher.data?.success && fetcher.data.intent === "limits") {
+      limitDraftRef.current = {};
+    }
+  }, [fetcher.state, fetcher.data]);
 
   const isSaving = fetcher.state === "submitting";
   const savedIntent = fetcher.data?.success ? fetcher.data.intent : undefined;
@@ -110,11 +152,29 @@ export default function Settings() {
 
   const confirmSave = (intent: SettingsIntent) => {
     if (isSaving || saveLockedRef.current) return;
-    const form = intent === "limits" ? limitsFormRef.current : promptsFormRef.current;
+    if (intent === "limits") {
+      const form = limitsFormRef.current;
+      if (!form) return;
+      saveLockedRef.current = true;
+      shopify.modal.hide(LIMITS_MODAL_ID);
+      const formData = new FormData();
+      formData.set("intent", "limits");
+      formData.set(
+        "dailyLimitLoggedIn",
+        limitDraftRef.current.dailyLimitLoggedIn ?? readLimitField(form, "dailyLimitLoggedIn"),
+      );
+      formData.set(
+        "dailyLimitAnonymous",
+        limitDraftRef.current.dailyLimitAnonymous ?? readLimitField(form, "dailyLimitAnonymous"),
+      );
+      fetcher.submit(formData, { method: "post" });
+      return;
+    }
+    const form = promptsFormRef.current;
     if (!form) return;
     saveLockedRef.current = true;
     confirmedSaveRef.current = true;
-    shopify.modal.hide(intent === "limits" ? LIMITS_MODAL_ID : PROMPTS_MODAL_ID);
+    shopify.modal.hide(PROMPTS_MODAL_ID);
     form.requestSubmit();
     if (confirmedSaveRef.current) {
       confirmedSaveRef.current = false;
